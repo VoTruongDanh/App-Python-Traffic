@@ -1,0 +1,13 @@
+{
+  "model_choice": "YOLOv26n (Fastest)",
+  "best_model_choice": "Custom (Browse file)...",
+  "tracker_choice": "SORT (Fast) \u2b50",
+  "confidence": 40,
+  "frame_skip": 0,
+  "resize_scale": "100% (Full Quality)",
+  "smooth_mode": false,
+  "stream_quality": "1080p (Best Quality)",
+  "video_type": "\ud83d\udd34 Livestream",
+  "roi_threshold": 38,
+  "roi_visible": true
+}

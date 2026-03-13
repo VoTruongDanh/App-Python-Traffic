@@ -1,0 +1,23 @@
+# Core Dependencies
+streamlit>=1.30.0
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+deep-sort-realtime>=1.3.2
+
+# PyTorch (CPU version - sẽ tự động dùng GPU nếu có CUDA)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image and Video Processing
+pillow>=10.0.0
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
+
+# Utilities
+requests>=2.31.0
+tqdm>=4.66.0
+yt-dlp>=2024.0.0
+
+# Optional: For better performance
+# torch-tensorrt  # Uncomment nếu có GPU NVIDIA
