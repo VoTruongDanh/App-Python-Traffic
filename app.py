@@ -4,6 +4,7 @@ Phát hiện và theo dõi Người & Xe trong video
 """
 import streamlit as st
 import os
+import sys
 import time
 import json
 from pathlib import Path
@@ -760,5 +761,16 @@ def show_footer():
 # RUN APP
 # =============================================================================
 if __name__ == "__main__":
-    main()
-    show_footer()
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        running_in_streamlit = get_script_run_ctx() is not None
+    except Exception:
+        running_in_streamlit = False
+
+    if running_in_streamlit:
+        main()
+        show_footer()
+    else:
+        from streamlit.web import cli as stcli
+        sys.argv = ["streamlit", "run", os.path.abspath(__file__)]
+        raise SystemExit(stcli.main())

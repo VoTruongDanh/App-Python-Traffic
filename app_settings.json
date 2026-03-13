@@ -2,7 +2,7 @@
   "model_choice": "YOLOv26n (Fastest)",
   "best_model_choice": "Custom (Browse file)...",
   "tracker_choice": "SORT (Fast) \u2b50",
-  "confidence": 40,
+  "confidence": 85,
   "frame_skip": 0,
   "resize_scale": "100% (Full Quality)",
   "smooth_mode": false,

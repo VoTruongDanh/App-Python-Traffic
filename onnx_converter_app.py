@@ -5,6 +5,8 @@ Simple UI to select .pt files and convert them
 import sys
 import os
 from pathlib import Path
+from convert_models_to_onnx import convert_model_to_onnx
+
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QListWidget, 
                              QListWidgetItem, QFileDialog, QTextEdit, QProgressBar,
@@ -27,8 +29,6 @@ class ConvertThread(QThread):
         import contextlib
         
         try:
-            from convert_models_to_onnx import convert_model_to_onnx
-            
             self.progress.emit(f"🔄 Converting {Path(self.model_path).name}...")
             
             # Capture stdout to show conversion progress

@@ -2,6 +2,9 @@
 PyQt5 Desktop App - Real-time Object Tracking
 High-performance alternative to Streamlit for local use
 """
+import config
+from model_loader import load_yolo_models, initialize_tracker
+
 import sys
 import cv2
 import numpy as np
@@ -14,9 +17,6 @@ from PyQt5.QtGui import QImage, QPixmap, QFont
 import time
 from pathlib import Path
 
-# Import existing modules
-import config
-from model_loader import load_yolo_models, initialize_tracker
 from video_processor import VideoProcessor
 # from video_processor_optimized import VideoProcessorOptimized as VideoProcessor
 from roi_manager import ROIManager

@@ -24,15 +24,14 @@ if not defined VENV_DIR (
     echo.
 )
 
-REM Activate virtual environment
-echo [INFO] Activating virtual environment: %VENV_DIR%
-call %VENV_DIR%\Scripts\activate.bat
+set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
 
 REM Check if PyQt5 is installed
-python -c "import PyQt5" 2>nul
+echo [INFO] Using Python interpreter: %VENV_PYTHON%
+%VENV_PYTHON% -c "import PyQt5" 2>nul
 if errorlevel 1 (
     echo [INFO] PyQt5 not found. Installing dependencies...
-    pip install -r requirements_pyqt.txt
+    %VENV_PYTHON% -m pip install -r requirements_pyqt.txt
     echo [OK] Dependencies installed.
     echo.
 )
@@ -40,9 +39,6 @@ if errorlevel 1 (
 REM Run the application
 echo [INFO] Starting PyQt5 application...
 echo.
-python pyqt_app.py
-
-REM Deactivate virtual environment
-deactivate
+%VENV_PYTHON% pyqt_app.py
 
 pause
