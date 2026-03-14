@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QSlider, QComboBox,
                              QFileDialog, QLineEdit, QGroupBox, QGridLayout, QTextEdit,
                              QDialog, QProgressBar, QListWidget, QListWidgetItem, QToolButton,
-                             QScrollArea, QFrame)
+                             QScrollArea, QFrame, QSizePolicy)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QFont
 import time
@@ -407,7 +407,9 @@ class MainWindow(QMainWindow):
         # Video display label
         self.video_label = QLabel()
         self.video_label.setObjectName("videoSurface")
-        self.video_label.setMinimumSize(960, 540)
+        self.video_label.setMinimumWidth(0)
+        self.video_label.setMinimumHeight(320)
+        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setText("Load video or livestream to begin")
         self.video_label.setMouseTracking(True)
@@ -545,13 +547,19 @@ class MainWindow(QMainWindow):
         self.last_model_selection = self.model_combo.currentText()
 
         custom_row = QHBoxLayout()
+        custom_row.setSpacing(6)
         self.custom_model_input = QLineEdit()
         self.custom_model_input.setReadOnly(True)
         self.custom_model_input.setPlaceholderText("No custom model selected")
+        self.custom_model_input.setMinimumWidth(0)
+        self.custom_model_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         custom_row.addWidget(self.custom_model_input)
 
         self.btn_browse_custom_model = QPushButton("Browse...")
         self.btn_browse_custom_model.setObjectName("secondaryAction")
+        self.btn_browse_custom_model.setMinimumWidth(0)
+        self.btn_browse_custom_model.setMaximumWidth(110)
+        self.btn_browse_custom_model.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.btn_browse_custom_model.clicked.connect(self.browse_custom_model)
         custom_row.addWidget(self.btn_browse_custom_model)
         model_layout.addLayout(custom_row)
@@ -746,18 +754,25 @@ class MainWindow(QMainWindow):
         # OPTIMIZATION: Add preset buttons
         perf_layout.addWidget(QLabel("Quick Presets:"))
         preset_layout = QHBoxLayout()
+        preset_layout.setSpacing(6)
         
         btn_quality = QPushButton("Quality")
+        btn_quality.setMinimumWidth(0)
+        btn_quality.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_quality.setToolTip("Skip:0 (~12-15 FPS)\nBest quality, slow")
         btn_quality.clicked.connect(lambda: self.apply_preset(0, 100))
         preset_layout.addWidget(btn_quality)
         
         btn_balanced = QPushButton("Balanced")
+        btn_balanced.setMinimumWidth(0)
+        btn_balanced.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_balanced.setToolTip("Skip:1 + Resize:75%\nBest balance for most cameras")
         btn_balanced.clicked.connect(lambda: self.apply_preset(1, 75))
         preset_layout.addWidget(btn_balanced)
         
         btn_speed = QPushButton("Speed")
+        btn_speed.setMinimumWidth(0)
+        btn_speed.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_speed.setToolTip("Skip:2 + Resize:50%\nHigh FPS with acceptable detail")
         btn_speed.clicked.connect(lambda: self.apply_preset(2, 50))
         btn_speed.setStyleSheet("background-color: #22c55e; color: white; font-weight: bold;")
@@ -890,6 +905,7 @@ class MainWindow(QMainWindow):
         
         # ROI control buttons
         roi_button_layout = QHBoxLayout()
+        roi_button_layout.setSpacing(6)
         
         self.btn_clear_roi = QPushButton("🗑️ Clear")
         self.btn_clear_roi.clicked.connect(self.clear_roi)
@@ -904,12 +920,17 @@ class MainWindow(QMainWindow):
         
         # Save/Load buttons
         roi_save_layout = QHBoxLayout()
+        roi_save_layout.setSpacing(6)
         
         self.btn_save_roi = QPushButton("💾 Save")
+        self.btn_save_roi.setMinimumWidth(0)
+        self.btn_save_roi.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.btn_save_roi.clicked.connect(self.save_roi)
         roi_save_layout.addWidget(self.btn_save_roi)
         
         self.btn_load_roi = QPushButton("📂 Load")
+        self.btn_load_roi.setMinimumWidth(0)
+        self.btn_load_roi.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.btn_load_roi.clicked.connect(self.load_roi)
         roi_save_layout.addWidget(self.btn_load_roi)
         
@@ -973,6 +994,34 @@ class MainWindow(QMainWindow):
             right_panel.removeWidget(widget)
             right_panel.insertWidget(index, widget)
 
+        compact_combos = [
+            self.model_combo,
+            self.tracker_combo,
+            self.stream_input,
+            self.stream_quality_combo,
+            self.video_type_combo,
+            self.resize_combo,
+            self.processing_mode_combo,
+        ]
+        for combo in compact_combos:
+            combo.setMinimumWidth(0)
+            combo.setMinimumContentsLength(1)
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        compact_buttons = [
+            self.btn_open_source_file,
+            self.btn_start_stream,
+            self.btn_smooth_toggle,
+            self.btn_adaptive_fps,
+            self.btn_clear_roi,
+            self.btn_toggle_roi,
+            self.btn_toggle_sidebar,
+        ]
+        for button in compact_buttons:
+            button.setMinimumWidth(0)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
         right_panel.addStretch()
         
         # Add panels to main layout
@@ -981,14 +1030,17 @@ class MainWindow(QMainWindow):
         # Wrap right panel in scroll area
         right_widget = QWidget()
         right_widget.setLayout(right_panel)
+        right_widget.setMinimumWidth(0)
+        right_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidget(right_widget)
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.scroll_area.setMinimumWidth(380)
-        self.scroll_area.setMaximumWidth(460)
+        self.scroll_area.setMinimumWidth(300)
+        self.scroll_area.setMaximumWidth(480)
+        self.scroll_area.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         
         main_layout.addWidget(self.scroll_area, 1)
         self.apply_theme()
