@@ -48,6 +48,7 @@ class VideoThread(QThread):
         self.resize_scale = 100
         self.smooth_mode = False  # Tắt smooth mode để tránh ghost frames
         self.max_det = 20  # Default max detections
+        self.output_fps_limit = 30
         
         self.frame_buffer = []  # DISABLED: Buffer causes 2-3 frame delay
         self.max_buffer_size = 1  # Keep only 1 frame (effectively disabled)
@@ -59,9 +60,11 @@ class VideoThread(QThread):
     def set_processor(self, processor):
         self.processor = processor
         
-    def set_params(self, frame_skip, resize_scale):
+    def set_params(self, frame_skip, resize_scale, output_fps_limit=None):
         self.frame_skip = frame_skip
         self.resize_scale = resize_scale
+        if output_fps_limit is not None:
+            self.output_fps_limit = max(5, int(output_fps_limit))
         
     def stop(self):
         self.running = False
@@ -87,8 +90,8 @@ class VideoThread(QThread):
             cap.set(cv2.CAP_PROP_FPS, 30)
         else:
             cap = cv2.VideoCapture(self.source)
-            # For HLS/HTTP streams
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+            # Keep generic streams closer to real-time by minimizing capture buffering.
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1 if isinstance(self.source, str) else 3)
             if isinstance(self.source, str) and ('http' in self.source or 'https' in self.source):
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
         
@@ -103,22 +106,49 @@ class VideoThread(QThread):
         last_success_time = time.time()
         consecutive_failures = 0
         
-        # FRAME PACING: Only for live streams, not video files
+        # FRAME PACING: keep output on a fixed cadence to avoid bursty playback.
         source_fps = cap.get(cv2.CAP_PROP_FPS)
         if source_fps <= 0 or source_fps > 120:
             source_fps = 30  # Default to 30 FPS
-        frame_interval = 1.0 / source_fps
-        last_frame_emit_time = time.time()
+        target_output_fps = min(float(source_fps), float(self.output_fps_limit))
+        if target_output_fps <= 0:
+            target_output_fps = 30.0
+        frame_interval = 1.0 / target_output_fps
+        next_emit_deadline = time.perf_counter()
         
         # Detect source type for pacing
         is_livestream = is_rtsp or (isinstance(self.source, str) and ('http' in self.source or 'https' in self.source))
-        is_video_file = not is_livestream and isinstance(self.source, str)
+
+        def pace_output():
+            """
+            Emit frames on a steady wall-clock cadence.
+
+            If processing falls behind, resume from "now" instead of trying
+            to catch up with a visible fast-forward jump.
+            """
+            nonlocal next_emit_deadline
+
+            next_emit_deadline += frame_interval
+            now = time.perf_counter()
+
+            if now > next_emit_deadline + frame_interval:
+                next_emit_deadline = now
+                return
+
+            sleep_time = next_emit_deadline - now
+            if sleep_time > 0:
+                time.sleep(sleep_time)
         
         try:
             while self.running:
+                processor_supports_async = hasattr(self.processor, 'process_frame_threaded')
+
                 # For RTSP, always grab latest frame (discard buffered frames)
                 if is_rtsp:
                     # Single grab is enough - reduced from 2 for better latency
+                    cap.grab()
+                elif is_livestream and time.perf_counter() > (next_emit_deadline + frame_interval):
+                    # Drop one stale buffered frame when live playback falls behind.
                     cap.grab()
                 
                 ret, frame = cap.read()
@@ -174,13 +204,14 @@ class VideoThread(QThread):
                 frame_count += 1
 
                 # Apply frame-skip before expensive processing
-                if self.frame_skip > 0:
+                if self.frame_skip > 0 and not processor_supports_async:
                     skip_counter = (skip_counter + 1) % (self.frame_skip + 1)
                     if skip_counter != 0:
                         if self.smooth_mode and last_processed_frame is not None:
                             self.frame_ready.emit(last_processed_frame, self._last_stats)
                         else:
                             self.frame_ready.emit(frame, self._last_stats)
+                        pace_output()
                         continue
                 
                 # OPTIMIZED: Process current frame directly (no buffer delay)
@@ -197,16 +228,7 @@ class VideoThread(QThread):
                     last_processed_frame = processed_frame
                     self._last_stats = stats
                     self.frame_ready.emit(processed_frame, stats)
-                    
-                    # FRAME PACING: Only for livestream to prevent fast-forward
-                    # Video files run at max FPS for fastest processing
-                    if is_livestream:
-                        current_time = time.time()
-                        elapsed = current_time - last_frame_emit_time
-                        sleep_time = frame_interval - elapsed
-                        if sleep_time > 0:
-                            time.sleep(sleep_time)
-                        last_frame_emit_time = time.time()
+                    pace_output()
                 except Exception as e:
                     print(f"Error: {e}")
                     import traceback
@@ -233,10 +255,18 @@ class MainWindow(QMainWindow):
         self.model_vehicle = None
         self.tracker = None
         self.fps_counter = 0
-        self.fps_start_time = time.time()
+        self.fps_start_time = time.perf_counter()
         self.current_fps = 0
+        self.render_fps_counter = 0
+        self.render_fps_start_time = time.perf_counter()
+        self.current_render_fps = 0.0
+        self.current_detect_fps = 0.0
+        self.fps_sample_interval = 0.5
+        self.fps_smoothing = 0.25
+        self.latest_active_objects = 0
+        self.latest_total_objects = 0
         self.last_display_time = 0.0
-        self.display_target_fps = 24
+        self.display_target_fps = 30
         self.display_frame_interval = 1.0 / self.display_target_fps
         self.last_auto_cleanup_time = 0.0
         self.auto_cleanup_cooldown = 20.0
@@ -245,6 +275,20 @@ class MainWindow(QMainWindow):
         self.last_stats_text = ""
         self.last_fps_color = ""
         self.video_source = None
+        self.pending_display_frame = None
+        self.pending_display_stats = {'total_objects': 0, 'class_counts': {}}
+        self.pending_frame_dirty = False
+        self.settings_loading = True
+        self.settings_save_timer = QTimer(self)
+        self.settings_save_timer.setSingleShot(True)
+        self.settings_save_timer.timeout.connect(self.save_settings)
+        self.adaptive_fps = True
+        self.last_adaptive_tune_time = 0.0
+        self.adaptive_tune_cooldown = 6.0
+        self.render_timer = QTimer(self)
+        self.render_timer.setInterval(int(1000 / self.display_target_fps))
+        self.render_timer.setTimerType(Qt.PreciseTimer)
+        self.render_timer.timeout.connect(self._render_latest_frame)
 
         # Debounced restart state for heavy changes while stream is running.
         self.pending_restart = False
@@ -279,6 +323,7 @@ class MainWindow(QMainWindow):
         
         # Load saved settings
         self.load_settings()
+        self.settings_loading = False
         
         # Load models in background
         QTimer.singleShot(100, self.load_models)
@@ -319,9 +364,12 @@ class MainWindow(QMainWindow):
         left_panel.addWidget(self.video_label)
         
         # FPS display
-        self.fps_label = QLabel("FPS: 0.0")
+        self.fps_label = QLabel("Display FPS: 0.0 | Process FPS: 0.0")
         self.fps_label.setObjectName("fpsBadge")
-        self.fps_label.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        self.fps_label.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        self.fps_label.setWordWrap(True)
+        self.fps_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.fps_label.setMinimumHeight(112)
         left_panel.addWidget(self.fps_label)
         
         # Control buttons
@@ -351,6 +399,7 @@ class MainWindow(QMainWindow):
         right_panel.setSpacing(10)
 
         runtime_shell = QFrame()
+        self.runtime_shell = runtime_shell
         runtime_shell.setObjectName("panelShell")
         runtime_shell_layout = QVBoxLayout(runtime_shell)
         runtime_shell_layout.setContentsMargins(0, 0, 0, 0)
@@ -407,6 +456,7 @@ class MainWindow(QMainWindow):
         
         # Model selection
         model_group = QGroupBox("Model Settings")
+        self.model_group = model_group
         model_layout = QVBoxLayout()
         
         self.custom_model_path = None
@@ -471,6 +521,7 @@ class MainWindow(QMainWindow):
         
         # Detection settings
         detection_group = QGroupBox("Detection Settings")
+        self.detection_group = detection_group
         detection_layout = QVBoxLayout()
         
         detection_layout.addWidget(QLabel("Confidence Threshold:"))
@@ -576,6 +627,7 @@ class MainWindow(QMainWindow):
         
         # Performance settings
         perf_group = QGroupBox("Performance Optimization")
+        self.perf_group = perf_group
         perf_layout = QVBoxLayout()
         
         perf_layout.addWidget(QLabel("Frame Skip:"))
@@ -676,13 +728,35 @@ class MainWindow(QMainWindow):
             lambda checked: self.toggle_smooth_mode(checked, self.btn_smooth_toggle)
         )
         perf_layout.addWidget(self.btn_smooth_toggle)
+
+        self.btn_adaptive_fps = QPushButton("Adaptive FPS Boost: ON")
+        self.btn_adaptive_fps.setCheckable(True)
+        self.btn_adaptive_fps.setChecked(True)
+        self.btn_adaptive_fps.setStyleSheet("background-color: #1d4ed8; color: white;")
+        self.btn_adaptive_fps.setToolTip(
+            "When live FPS drops, the app will step down frame skip and resize\n"
+            "to keep latency low and output smooth."
+        )
+        self.btn_adaptive_fps.clicked.connect(self.toggle_adaptive_fps)
+        perf_layout.addWidget(self.btn_adaptive_fps)
         
         perf_group.setLayout(perf_layout)
         right_panel.addWidget(perf_group)
         
-        # Livestream input
-        stream_group = QGroupBox("Livestream Input")
+        # Video source
+        stream_group = QGroupBox("Video Source")
+        self.stream_group = stream_group
         stream_layout = QVBoxLayout()
+
+        source_hint = QLabel("Open a local file or paste a YouTube, RTSP, HTTP stream, or webcam ID.")
+        source_hint.setObjectName("subtleInfo")
+        source_hint.setWordWrap(True)
+        stream_layout.addWidget(source_hint)
+
+        self.btn_open_source_file = QPushButton("Open Video File...")
+        self.btn_open_source_file.setObjectName("secondaryAction")
+        self.btn_open_source_file.clicked.connect(self.load_video_file)
+        stream_layout.addWidget(self.btn_open_source_file)
         
         stream_layout.addWidget(QLabel("YouTube/RTSP URL or Webcam ID:"))
         self.stream_input = QComboBox()
@@ -690,6 +764,7 @@ class MainWindow(QMainWindow):
         self.stream_input.setPlaceholderText("https://youtube.com/... or 0 for webcam")
         self.stream_input.setMaxCount(5)  # Keep only 5 items
         self.stream_input.setInsertPolicy(QComboBox.InsertAtTop)
+        self.stream_input.currentTextChanged.connect(lambda _: self.schedule_settings_save())
         
         # Load history from file
         self.load_stream_history()
@@ -706,6 +781,7 @@ class MainWindow(QMainWindow):
             "360p (Fastest)"
         ])
         self.stream_quality_combo.setCurrentIndex(1)  # Default 720p
+        self.stream_quality_combo.currentTextChanged.connect(lambda _: self.schedule_settings_save())
         self.stream_quality_combo.setToolTip(
             "1080p: Highest quality, may lag\n"
             "720p: Balanced (Recommended)\n"
@@ -722,13 +798,14 @@ class MainWindow(QMainWindow):
             "🔴 Livestream"
         ])
         self.video_type_combo.setCurrentIndex(0)  # Default: Regular video
+        self.video_type_combo.currentTextChanged.connect(lambda _: self.schedule_settings_save())
         self.video_type_combo.setToolTip(
             "Regular Video: Stream video thường (không tải hết)\n"
             "Livestream: Video đang phát trực tiếp"
         )
         stream_layout.addWidget(self.video_type_combo)
         
-        self.btn_start_stream = QPushButton("📡 Start Livestream")
+        self.btn_start_stream = QPushButton("Start Source")
         self.btn_start_stream.setObjectName("accentAction")
         self.btn_start_stream.clicked.connect(self.start_livestream)
         stream_layout.addWidget(self.btn_start_stream)
@@ -738,6 +815,7 @@ class MainWindow(QMainWindow):
         
         # ROI Settings
         roi_group = QGroupBox("ROI (Region of Interest)")
+        self.roi_group = roi_group
         roi_layout = QVBoxLayout()
         
         # ROI drawing button
@@ -796,6 +874,7 @@ class MainWindow(QMainWindow):
         
         # Statistics display
         stats_group = QGroupBox("Statistics")
+        self.stats_group = stats_group
         stats_layout = QVBoxLayout()
         
         # Current model info
@@ -807,10 +886,14 @@ class MainWindow(QMainWindow):
         self.stats_text = QTextEdit()
         self.stats_text.setObjectName("statsPanel")
         self.stats_text.setReadOnly(True)
-        self.stats_text.setMaximumHeight(140)
+        self.stats_text.setLineWrapMode(QTextEdit.NoWrap)
+        self.stats_text.setMinimumHeight(240)
+        self.stats_text.setMaximumHeight(320)
         self.stats_text.setPlainText(
+            "SESSION TOTAL: 0\n"
+            "ACTIVE NOW:    0\n\n"
             "No session data yet.\n\n"
-            "Recommended workflow:\n"
+            "Tips:\n"
             "- Start with 75% resize\n"
             "- Use Ultra mode for live streams\n"
             "- Keep tracker on Simple or SORT when tuning FPS"
@@ -824,7 +907,21 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Ready")
         self.status_label.setObjectName("statusLine")
         right_panel.addWidget(self.status_label)
-        
+
+        ordered_widgets = [
+            self.stream_group,
+            self.runtime_shell,
+            self.model_group,
+            self.perf_group,
+            self.detection_group,
+            self.roi_group,
+            self.stats_group,
+            self.status_label,
+        ]
+        for index, widget in enumerate(ordered_widgets):
+            right_panel.removeWidget(widget)
+            right_panel.insertWidget(index, widget)
+
         right_panel.addStretch()
         
         # Add panels to main layout
@@ -839,8 +936,8 @@ class MainWindow(QMainWindow):
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.scroll_area.setMinimumWidth(350)
-        self.scroll_area.setMaximumWidth(420)
+        self.scroll_area.setMinimumWidth(380)
+        self.scroll_area.setMaximumWidth(460)
         
         main_layout.addWidget(self.scroll_area, 1)
         self.apply_theme()
@@ -903,8 +1000,10 @@ class MainWindow(QMainWindow):
                 color: #1f2933;
                 background: #fff7ed;
                 border: 1px solid #f0b47a;
-                border-radius: 10px;
-                padding: 7px 12px;
+                border-radius: 14px;
+                padding: 12px 16px;
+                font-size: 15px;
+                line-height: 1.35;
             }
             QLabel#metricChip {
                 background: #f5efe3;
@@ -962,8 +1061,9 @@ class MainWindow(QMainWindow):
                 border: 1px solid #293847;
                 border-radius: 14px;
                 font-family: "Consolas", "Courier New", monospace;
-                font-size: 11px;
-                padding: 10px;
+                font-size: 16px;
+                font-weight: 600;
+                padding: 18px;
             }
             QPushButton {
                 background: #e8ddd0;
@@ -1092,6 +1192,7 @@ class MainWindow(QMainWindow):
         """
         self._set_processing_mode_flags(mode)
         self._sync_processing_mode_buttons()
+        self.schedule_settings_save()
 
         current_mode = self._get_processing_mode()
         if current_mode == "standard":
@@ -1117,6 +1218,19 @@ class MainWindow(QMainWindow):
         if "sort" in name and "deepsort" not in name:
             return "SORT (Fast)"
         return "DeepSORT (Stable)"
+
+    def _shutdown_processor_workers(self):
+        """Stop background processor workers before replacing or idling a processor."""
+        if not self.processor:
+            return
+
+        try:
+            if hasattr(self.processor, 'stop_async_inference'):
+                self.processor.stop_async_inference()
+            if hasattr(self.processor, 'stop_threads'):
+                self.processor.stop_threads()
+        except Exception as exc:
+            print(f"[WARN] Processor worker shutdown skipped: {exc}")
 
     def _sync_tracker_combo_with_runtime(self):
         """Keep tracker combo aligned with actual tracker in use."""
@@ -1172,6 +1286,7 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         
         try:
+            self._shutdown_processor_workers()
             # Set model choice in app state
             app_state.tracker_choice = self.tracker_combo.currentText()
             if not self._resolve_model_selection(self.model_combo.currentText(), prompt_for_custom=False):
@@ -1214,6 +1329,17 @@ class MainWindow(QMainWindow):
                 print("Using Standard Processor")
                 
             self.processor.set_confidence(self.confidence_slider.value() / 100.0)
+            if hasattr(self.processor, 'set_box_thickness'):
+                self.processor.set_box_thickness(self.box_thickness_slider.value())
+            if hasattr(self.processor, 'set_font_size'):
+                self.processor.set_font_size(self.font_size_slider.value())
+            if hasattr(self.processor, 'set_font_thickness'):
+                self.processor.set_font_thickness(self.font_thickness_slider.value())
+            if hasattr(self.processor, 'set_point_mode'):
+                self.processor.set_point_mode(self.btn_display_mode.isChecked())
+            if hasattr(self.processor, 'set_frame_skip'):
+                self.processor.set_frame_skip(self.frame_skip_slider.value())
+            config.TRAIL_LENGTH = 3 if self.btn_trail_toggle.isChecked() else 0
             
             # Connect ROI manager to processor
             self.processor.set_roi_manager(self.roi_manager)
@@ -1233,7 +1359,9 @@ class MainWindow(QMainWindow):
                     f"Models loaded: {display_model_name} | Backend: {backend_text} | Conf auto -> 0.{lowered_confidence:02d}"
                 )
             self.btn_load_video.setEnabled(True)
+            self.btn_open_source_file.setEnabled(True)
             self.btn_start_stream.setEnabled(True)
+            self.btn_start.setEnabled(bool(self.video_source))
         except Exception as e:
             self.status_label.setText(f"Error loading models: {e}")
 
@@ -1268,17 +1396,106 @@ class MainWindow(QMainWindow):
             return "Live URL"
         return Path(source_text).name
 
+    def _is_live_source(self) -> bool:
+        """Return True for live URL/webcam style sources."""
+        if isinstance(self.video_source, int):
+            return True
+
+        if not self.video_source:
+            return False
+
+        source_text = str(self.video_source).strip()
+        if source_text.isdigit():
+            return True
+        return source_text.startswith(("rtsp://", "http://", "https://"))
+
+    def _current_resize_scale(self) -> int:
+        """Read the active resize percentage from the combo."""
+        resize_text = self.resize_combo.currentText().split()[0]
+        return int(resize_text.replace('%', ''))
+
+    def _set_resize_scale(self, resize_scale: int):
+        """Apply a supported resize preset."""
+        resize_map = {100: 0, 75: 1, 50: 2, 25: 3}
+        index = resize_map.get(resize_scale)
+        if index is not None:
+            self.resize_combo.setCurrentIndex(index)
+
+    def schedule_settings_save(self):
+        """Debounce settings writes so panel interactions stay responsive."""
+        if getattr(self, 'settings_loading', False):
+            return
+        self.settings_save_timer.start(450)
+
+    def toggle_adaptive_fps(self, checked):
+        """Enable or disable live FPS auto-tuning."""
+        self.adaptive_fps = checked
+        if checked:
+            self.btn_adaptive_fps.setText("Adaptive FPS Boost: ON")
+            self.btn_adaptive_fps.setStyleSheet("background-color: #1d4ed8; color: white;")
+            self.status_label.setText("Adaptive FPS boost enabled")
+        else:
+            self.btn_adaptive_fps.setText("Adaptive FPS Boost: OFF")
+            self.btn_adaptive_fps.setStyleSheet("background-color: #64748b; color: white;")
+            self.status_label.setText("Adaptive FPS boost disabled")
+        self.schedule_settings_save()
+
+    def _maybe_adaptive_tune(self):
+        """Step down live processing load when sustained FPS becomes too low."""
+        if not self.adaptive_fps or not self._is_live_source():
+            return
+
+        if not (self.video_thread and self.video_thread.isRunning()):
+            return
+
+        now = time.time()
+        if (now - self.last_adaptive_tune_time) < self.adaptive_tune_cooldown:
+            return
+
+        profile_ladder = [
+            (0, 100),
+            (0, 75),
+            (1, 75),
+            (2, 50),
+            (3, 50),
+            (4, 25),
+        ]
+        current_profile = (self.frame_skip_slider.value(), self._current_resize_scale())
+        try:
+            current_index = profile_ladder.index(current_profile)
+        except ValueError:
+            current_index = 0
+
+        target_index = current_index
+        if self.current_fps < 6.0:
+            target_index = min(len(profile_ladder) - 1, current_index + 2)
+        elif self.current_fps < 10.0:
+            target_index = min(len(profile_ladder) - 1, current_index + 1)
+
+        if target_index == current_index:
+            return
+
+        target_skip, target_resize = profile_ladder[target_index]
+        self.last_adaptive_tune_time = now
+        self.frame_skip_slider.setValue(target_skip)
+        self._set_resize_scale(target_resize)
+        self.status_label.setText(
+            f"Adaptive FPS boost: frame skip {target_skip}, resize {target_resize}%"
+        )
+
     def toggle_sidebar(self):
         """Show or hide the right-side control panel."""
         visible = not self.scroll_area.isVisible()
         self.scroll_area.setVisible(visible)
         self.btn_toggle_sidebar.setText("Hide Controls" if visible else "Show Controls")
+        self.schedule_settings_save()
 
     def toggle_runtime_section(self):
         """Collapse or expand the runtime overview card."""
         expanded = self.runtime_toggle_button.isChecked()
         self.runtime_panel.setVisible(expanded)
         self.runtime_toggle_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.schedule_settings_save()
 
     def _open_file_dialog(self, title: str, file_filter: str):
         """Open a modal file dialog that stays above the app window."""
@@ -1336,6 +1553,7 @@ class MainWindow(QMainWindow):
         if not self._resolve_model_selection("Custom model...", prompt_for_custom=False):
             self.status_label.setText("Unable to apply custom model")
             return False
+        self.schedule_settings_save()
 
         if self.video_thread and self.video_thread.isRunning():
             self.pending_reload_models = True
@@ -1502,6 +1720,7 @@ class MainWindow(QMainWindow):
             if not self._resolve_model_selection(model_name, prompt_for_custom=True):
                 self.status_label.setText("Model selection canceled")
                 return
+            self.schedule_settings_save()
             if self.video_thread and self.video_thread.isRunning():
                 self.pending_reload_models = True
                 self.auto_reload_if_running(reason=f"Switching model to {model_name}...")
@@ -1564,6 +1783,7 @@ class MainWindow(QMainWindow):
     def on_tracker_changed(self, tracker_name):
         """Handle tracker selection change"""
         app_state.tracker_choice = tracker_name
+        self.schedule_settings_save()
         try:
             if self.video_thread and self.video_thread.isRunning():
                 self.pending_reload_models = True
@@ -1580,24 +1800,28 @@ class MainWindow(QMainWindow):
         self.confidence_label.setText(f"{conf:.2f}")
         if self.processor:
             self.processor.set_confidence(conf)
+        self.schedule_settings_save()
     
     def on_box_thickness_changed(self, value):
         """Handle box thickness change"""
         self.box_thickness_label.setText(f"{value} px")
         if self.processor:
             self.processor.set_box_thickness(value)
+        self.schedule_settings_save()
     
     def on_font_size_changed(self, value):
         """Handle font size change"""
         self.font_size_label.setText(f"{value} pt")
         if self.processor:
             self.processor.set_font_size(value)
+        self.schedule_settings_save()
     
     def on_font_thickness_changed(self, value):
         """Handle font thickness change"""
         self.font_thickness_label.setText(f"{value}")
         if self.processor and hasattr(self.processor, 'set_font_thickness'):
             self.processor.set_font_thickness(value)
+        self.schedule_settings_save()
     
     def toggle_display_mode(self, checked):
         """Toggle between Point Label and Bounding Box mode"""
@@ -1611,6 +1835,7 @@ class MainWindow(QMainWindow):
         else:
             self.btn_display_mode.setText("📦 Display: Bounding Box")
             self.btn_display_mode.setStyleSheet("background-color: #475569; color: white;")
+        self.schedule_settings_save()
     
     def toggle_trail(self, checked):
         """Toggle trail drawing"""
@@ -1623,6 +1848,7 @@ class MainWindow(QMainWindow):
             config.TRAIL_LENGTH = 0  # Disable trail
             self.btn_trail_toggle.setText("🔴 Trail: OFF")
             self.btn_trail_toggle.setStyleSheet("background-color: #b42318; color: white;")
+        self.schedule_settings_save()
     
     def manual_cleanup(self):
         """Manual memory cleanup"""
@@ -1677,6 +1903,7 @@ class MainWindow(QMainWindow):
         self.max_det_label.setText(f"{value} objects")
         if self.video_thread and self.video_thread.isRunning():
             self.video_thread.max_det = value
+        self.schedule_settings_save()
     
     def on_tracker_age_changed(self, value):
         """Handle tracker max age change"""
@@ -1689,18 +1916,23 @@ class MainWindow(QMainWindow):
         if self.tracker:
             if hasattr(self.tracker, 'max_age'):
                 self.tracker.max_age = value
+        self.schedule_settings_save()
 
     def on_frame_skip_changed(self, value):
         """Apply frame skip live without restarting the stream."""
         self.frame_skip_label.setText(f"Skip: {value} frames")
         if self.video_thread and self.video_thread.isRunning():
             self.video_thread.frame_skip = value
+        if self.processor and hasattr(self.processor, 'set_frame_skip'):
+            self.processor.set_frame_skip(value)
+        self.schedule_settings_save()
 
     def on_resize_changed(self, text):
         """Apply resize scale live when possible."""
         resize_scale = int(text.split()[0].replace('%', ''))
         if self.video_thread and self.video_thread.isRunning():
             self.video_thread.resize_scale = resize_scale
+        self.schedule_settings_save()
 
     def auto_reload_if_running(self, reason="Applying changes..."):
         """Debounce a heavy restart only when the current source is running."""
@@ -1764,6 +1996,7 @@ class MainWindow(QMainWindow):
         # Update thread if running
         if self.video_thread and self.video_thread.isRunning():
             self.video_thread.smooth_mode = self.smooth_mode
+        self.schedule_settings_save()
     
     def toggle_roi_drawing(self, checked):
         """Toggle ROI drawing mode"""
@@ -1781,6 +2014,7 @@ class MainWindow(QMainWindow):
                 self.roi_manager.set_points(self.roi_temp_points)
                 self.update_roi_status()
                 self.status_label.setText(f"ROI set with {len(self.roi_temp_points)} points")
+                self.schedule_settings_save()
             else:
                 self.status_label.setText("ROI needs at least 3 points")
             self.roi_temp_points = []
@@ -1866,6 +2100,7 @@ class MainWindow(QMainWindow):
         self.roi_threshold_label.setText(f"{value}%")
         self.roi_manager.set_threshold(threshold)
         self.update_roi_status()
+        self.schedule_settings_save()
     
     def toggle_roi_visibility(self, checked):
         """Toggle ROI overlay visibility"""
@@ -1880,6 +2115,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("👁️ ROI overlay visible")
 
         self.video_label.update()
+        self.schedule_settings_save()
     
     def clear_roi(self):
         """Clear ROI"""
@@ -1892,6 +2128,7 @@ class MainWindow(QMainWindow):
         self.update_roi_status()
         self.status_label.setText("🗑️ ROI cleared")
         self.video_label.update()
+        self.schedule_settings_save()
     
     def save_roi(self):
         """Save ROI configuration to file"""
@@ -1933,6 +2170,7 @@ class MainWindow(QMainWindow):
                 
                 self.update_roi_status()
                 self.status_label.setText(f"📂 ROI loaded from {Path(file_path).name}")
+                self.schedule_settings_save()
             except Exception as e:
                 self.status_label.setText(f"❌ Error loading ROI: {e}")
     
@@ -1959,6 +2197,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Loaded: {Path(file_path).name}")
             self.btn_start.setEnabled(True)
             self._refresh_runtime_overview()
+            self.schedule_settings_save()
             
     def start_livestream(self):
         """Start livestream processing"""
@@ -1970,6 +2209,7 @@ class MainWindow(QMainWindow):
         
         # Save to history
         self.save_stream_to_history(stream_url)
+        self.schedule_settings_save()
             
         # Check if webcam ID
         if stream_url.isdigit():
@@ -2089,25 +2329,40 @@ class MainWindow(QMainWindow):
         self.video_thread = VideoThread()
         self.video_thread.set_source(self.video_source)
         self.video_thread.set_processor(self.processor)
-        self.video_thread.set_params(frame_skip, resize_scale)
+        self.video_thread.set_params(frame_skip, resize_scale, self.display_target_fps)
         self.video_thread.max_det = self.max_det  # Pass max_det
         self.video_thread.smooth_mode = self.smooth_mode
         self.video_thread.frame_ready.connect(self.update_frame)
         self.video_thread.finished.connect(self.on_processing_finished)
         self.video_thread.start()
+        self.render_timer.start()
         
         # Update UI
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.btn_load_video.setEnabled(False)
+        self.btn_open_source_file.setEnabled(False)
         self.btn_start_stream.setEnabled(False)
         self.status_label.setText("Processing...")
         
         # Reset FPS counter
         self.fps_counter = 0
-        self.fps_start_time = time.time()
+        self.fps_start_time = time.perf_counter()
+        self.render_fps_counter = 0
+        self.render_fps_start_time = time.perf_counter()
+        self.current_fps = 0.0
+        self.current_detect_fps = 0.0
+        self.current_render_fps = 0.0
         self.fps_history = []  # Clear FPS history
         self.last_display_time = 0.0
+        self.last_adaptive_tune_time = 0.0
+        self.last_fps_color = ""
+        self.last_stats_text = ""
+        self.pending_display_frame = None
+        self.pending_display_stats = {'total_objects': 0, 'class_counts': {}}
+        self.pending_frame_dirty = False
+        self._update_fps_summary(self.pending_display_stats)
+        self._update_stats_panel(self.pending_display_stats)
         self._refresh_runtime_overview()
         
     def stop_processing(self, preserve_pending=False):
@@ -2119,6 +2374,7 @@ class MainWindow(QMainWindow):
         if self.video_thread:
             self.video_thread.stop()
             self.video_thread.wait()
+        self._shutdown_processor_workers()
             
     def on_processing_finished(self):
         """Handle processing finished"""
@@ -2135,32 +2391,174 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_load_video.setEnabled(True)
+        self.btn_open_source_file.setEnabled(True)
         self.btn_start_stream.setEnabled(True)
         self.status_label.setText("Stopped")
+        self.render_timer.stop()
         self._refresh_runtime_overview()
+
+    def _smooth_fps_value(self, current_value, sample_value):
+        """Blend FPS samples so short spikes do not thrash the UI."""
+        if sample_value <= 0:
+            return current_value
+        if current_value <= 0:
+            return sample_value
+        return current_value + (sample_value - current_value) * self.fps_smoothing
+
+    def _format_count_summary(self, counts, empty_text="none"):
+        """Render class counts on a single line for the compact FPS card."""
+        if not counts:
+            return empty_text
+        return " | ".join(f"{cls_name}:{count}" for cls_name, count in sorted(counts.items()))
+
+    def _format_count_block(self, title, counts):
+        """Render aligned count rows for the detailed stats panel."""
+        if not counts:
+            return ""
+
+        name_width = max(12, max(len(cls_name) for cls_name in counts))
+        lines = [title]
+        for cls_name, count in sorted(counts.items()):
+            lines.append(f"  {cls_name:<{name_width}} {count:>4}")
+        return "\n".join(lines)
+
+    def _set_fps_badge_color(self, fps_value):
+        """Color the FPS badge based on the slower visible rate."""
+        if fps_value >= 20:
+            color = '#22c55e'
+        elif fps_value >= 10:
+            color = '#f59e0b'
+        else:
+            color = '#ef4444'
+
+        if color == self.last_fps_color:
+            return
+
+        self.fps_label.setStyleSheet(
+            "color: {color};"
+            "background: #fff7ed;"
+            "border: 1px solid #f0b47a;"
+            "border-radius: 14px;"
+            "padding: 12px 16px;"
+            "font-size: 15px;"
+            "font-weight: 700;"
+        .format(color=color))
+        self.last_fps_color = color
+
+    def _update_fps_summary(self, stats):
+        """Combine FPS and the most useful runtime stats into one large card."""
+        active_objects = stats.get('active_objects', stats.get('total_objects', 0))
+        total_objects = stats.get('total_objects', 0)
+        active_class_counts = stats.get('active_class_counts', stats.get('class_counts', {}))
+        avg_fps = sum(self.fps_history) / len(self.fps_history) if self.fps_history else self.current_fps
+
+        summary_lines = [
+            f"Display FPS: {self.current_render_fps:4.1f} | Process FPS: {self.current_fps:4.1f} | Avg: {avg_fps:4.1f}",
+            f"Active: {active_objects} | Session: {total_objects}",
+            f"Now: {self._format_count_summary(active_class_counts, 'no detections')}",
+        ]
+        self.fps_label.setText("\n".join(summary_lines))
+
+        visible_fps = min(
+            value for value in (self.current_render_fps, self.current_fps) if value > 0
+        ) if (self.current_render_fps > 0 or self.current_fps > 0) else 0.0
+        self._set_fps_badge_color(visible_fps)
+
+    def _update_stats_panel(self, stats):
+        """Render the detailed stats panel with larger, aligned text."""
+        active_objects = stats.get('active_objects', stats.get('total_objects', 0))
+        total_objects = stats.get('total_objects', 0)
+        active_class_counts = stats.get('active_class_counts', stats.get('class_counts', {}))
+        total_class_counts = stats.get('class_counts', {})
+
+        lines = [
+            f"SESSION TOTAL: {total_objects}",
+            f"ACTIVE NOW:    {active_objects}",
+            "",
+        ]
+
+        session_block = self._format_count_block("Session Counts", total_class_counts)
+        active_block = self._format_count_block("Active Frame", active_class_counts)
+
+        if session_block:
+            lines.append(session_block)
+            lines.append("")
+
+        if active_block:
+            lines.append(active_block)
+        elif total_objects <= 0 and active_objects <= 0:
+            lines.extend([
+                "No active detections.",
+                "",
+                "Tips:",
+                "- Use Ultra mode for livestreams",
+                "- Lower resize to 75% or 50%",
+                "- Keep tracker on Simple or SORT for higher FPS",
+            ])
+
+        stats_text = "\n".join(lines).strip()
+        if stats_text != self.last_stats_text:
+            self.stats_text.setPlainText(stats_text)
+            self.last_stats_text = stats_text
         
     def update_frame(self, frame, stats):
-        """Update video display with processed frame - OPTIMIZED"""
-        # Render throttle to reduce UI thread overhead
-        now = time.perf_counter()
-        if (now - self.last_display_time) < self.display_frame_interval:
+        """Receive the latest processed frame without doing heavy GUI work."""
+        self.pending_display_frame = frame
+        self.pending_display_stats = stats
+        self.pending_frame_dirty = True
+
+        # Update FPS/statistics based on processed-frame arrivals.
+        self.fps_counter += 1
+        elapsed = time.perf_counter() - self.fps_start_time
+        if elapsed >= self.fps_sample_interval:
+            now = time.perf_counter()
+            self.current_detect_fps = self.fps_counter / elapsed
+            self.current_fps = self._smooth_fps_value(self.current_fps, self.current_detect_fps)
+
+            # Add to history (ignore very low FPS from lag/model switch)
+            if self.current_fps >= 5.0:
+                self.fps_history.append(self.current_fps)
+                if len(self.fps_history) > self.fps_history_max:
+                    self.fps_history.pop(0)
+
+            # AUTO CLEANUP if FPS drops significantly (with cooldown)
+            if self._is_live_source() and len(self.fps_history) >= 6:
+                avg_fps = sum(self.fps_history) / len(self.fps_history)
+                low_fps_threshold = max(6.0, avg_fps * 0.55)
+                if self.current_fps < low_fps_threshold:
+                    since_last_cleanup = time.time() - self.last_auto_cleanup_time
+                    if since_last_cleanup >= self.auto_cleanup_cooldown:
+                        self.last_auto_cleanup_time = time.time()
+                        QTimer.singleShot(0, self.manual_cleanup)
+
+            self._maybe_adaptive_tune()
+            self._update_fps_summary(stats)
+            self._update_stats_panel(stats)
+
+            self.fps_counter = 0
+            self.fps_start_time = time.perf_counter()
+
+            if (now - self.last_runtime_refresh_time) >= self.runtime_refresh_interval:
+                self._refresh_runtime_overview()
+                self.last_runtime_refresh_time = now
+
+    def _render_latest_frame(self):
+        """Render the newest frame at a stable UI cadence."""
+        if self.pending_display_frame is None:
             return
-        self.last_display_time = now
 
-        # Always render on a writable copy so UI overlays behave consistently
-        # across Standard / Threaded / Optimized / Ultra processor modes.
-        frame = frame.copy()
+        if not self.pending_frame_dirty and not self.roi_drawing_mode:
+            return
 
-        # Store original frame size for ROI coordinate mapping
+        frame = self.pending_display_frame.copy()
+        self.pending_frame_dirty = False
+
         original_h, original_w = frame.shape[:2]
         self.current_frame_size = (original_w, original_h)
 
-        # Draw finalized ROI overlay in the UI layer so it remains visible even
-        # when the active processor mode skips ROI drawing for performance.
         if self.roi_manager and self.roi_manager.is_active():
             self.roi_manager.draw_roi(frame)
-        
-        # Draw temporary ROI points if in drawing mode (on original frame)
+
         if self.roi_drawing_mode and len(self.roi_temp_points) > 0:
             for i, point in enumerate(self.roi_temp_points):
                 cv2.circle(frame, point, 8, (0, 255, 255), -1)
@@ -2177,7 +2575,6 @@ class MainWindow(QMainWindow):
             text_overlay = f"ROI: {len(self.roi_temp_points)} points (Right-click to finish)"
             cv2.putText(frame, text_overlay, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        # Use BGR888 directly to avoid cvtColor overhead
         if not frame.flags['C_CONTIGUOUS']:
             frame = np.ascontiguousarray(frame)
         h, w, ch = frame.shape
@@ -2196,62 +2593,14 @@ class MainWindow(QMainWindow):
         )
         self.video_label.setPixmap(scaled_pixmap)
 
-        # Update FPS counter
-        self.fps_counter += 1
-        elapsed = time.time() - self.fps_start_time
-        if elapsed >= 1.0:
-            self.current_fps = self.fps_counter / elapsed
-
-            # Add to history (ignore very low FPS from lag/model switch)
-            if self.current_fps >= 5.0:
-                self.fps_history.append(self.current_fps)
-                if len(self.fps_history) > self.fps_history_max:
-                    self.fps_history.pop(0)
-
-            # AUTO CLEANUP if FPS drops significantly (with cooldown)
-            if len(self.fps_history) >= 5:
-                avg_fps = sum(self.fps_history) / len(self.fps_history)
-                if self.current_fps < avg_fps * 0.7:
-                    since_last_cleanup = time.time() - self.last_auto_cleanup_time
-                    if since_last_cleanup >= self.auto_cleanup_cooldown:
-                        self.last_auto_cleanup_time = time.time()
-                        QTimer.singleShot(0, self.manual_cleanup)
-
-            if len(self.fps_history) > 0:
-                avg_fps = sum(self.fps_history) / len(self.fps_history)
-                self.fps_label.setText(f"FPS: {self.current_fps:.1f} (avg: {avg_fps:.1f})")
-            else:
-                self.fps_label.setText(f"FPS: {self.current_fps:.1f}")
-
-            if self.current_fps >= 20:
-                color = '#4ade80'
-            elif self.current_fps >= 10:
-                color = '#fbbf24'
-            else:
-                color = '#ef4444'
-            if color != self.last_fps_color:
-                self.fps_label.setStyleSheet(f"color: {color}; padding: 5px; font-weight: bold;")
-                self.last_fps_color = color
-
-            self.fps_counter = 0
-            self.fps_start_time = time.time()
-
-            # Update stats only once per second
-            if stats['total_objects'] > 0:
-                stats_text = f"Total Objects: {stats['total_objects']}\n\n"
-                stats_text += "Detections:\n"
-                for cls_name, count in stats['class_counts'].items():
-                    stats_text += f"  {cls_name}: {count}\n"
-            else:
-                stats_text = "No active detections.\n\nTips:\n- Use Ultra mode for livestreams\n- Lower resize to 75% or 50%\n- Keep tracker on Simple or SORT for higher FPS"
-
-            if stats_text != self.last_stats_text:
-                self.stats_text.setPlainText(stats_text)
-                self.last_stats_text = stats_text
-
-            if (now - self.last_runtime_refresh_time) >= self.runtime_refresh_interval:
-                self._refresh_runtime_overview()
-                self.last_runtime_refresh_time = now
+        self.render_fps_counter += 1
+        render_elapsed = time.perf_counter() - self.render_fps_start_time
+        if render_elapsed >= self.fps_sample_interval:
+            render_sample = self.render_fps_counter / render_elapsed
+            self.current_render_fps = self._smooth_fps_value(self.current_render_fps, render_sample)
+            self.render_fps_counter = 0
+            self.render_fps_start_time = time.perf_counter()
+            self._update_fps_summary(self.pending_display_stats)
 
     def closeEvent(self, event):
         """Handle window close"""
@@ -2264,6 +2613,12 @@ class MainWindow(QMainWindow):
     
     def save_settings(self):
         """Save all settings to file"""
+        last_video_file_path = None
+        if isinstance(self.video_source, str):
+            source_text = self.video_source.strip()
+            if source_text and not source_text.startswith(("rtsp://", "http://", "https://")) and Path(source_text).exists():
+                last_video_file_path = source_text
+
         settings = {
             # Model settings
             'model_choice': self.model_combo.currentText(),
@@ -2272,20 +2627,35 @@ class MainWindow(QMainWindow):
             
             # Detection settings
             'confidence': self.confidence_slider.value(),
+            'box_thickness': self.box_thickness_slider.value(),
+            'font_size': self.font_size_slider.value(),
+            'font_thickness': self.font_thickness_slider.value(),
+            'display_point_mode': self.btn_display_mode.isChecked(),
+            'trail_enabled': self.btn_trail_toggle.isChecked(),
+            'max_det': self.max_det_slider.value(),
+            'tracker_age': self.tracker_age_slider.value(),
             
             # Performance settings
             'frame_skip': self.frame_skip_slider.value(),
             'resize_scale': self.resize_combo.currentText(),
             'smooth_mode': self.smooth_mode,
             'processing_mode': self._get_processing_mode(),
+            'adaptive_fps': self.adaptive_fps,
             
             # Stream settings
+            'stream_input': self.stream_input.currentText().strip(),
             'stream_quality': self.stream_quality_combo.currentText(),
             'video_type': self.video_type_combo.currentText(),
+            'last_video_file_path': last_video_file_path,
             
             # ROI settings
             'roi_threshold': self.roi_threshold_slider.value(),
             'roi_visible': self.roi_visible,
+            'roi_config': self.roi_manager.get_config() if self.roi_manager.is_active() else None,
+
+            # Panel state
+            'sidebar_visible': self.scroll_area.isVisible(),
+            'runtime_expanded': self.runtime_toggle_button.isChecked(),
         }
         
         try:
@@ -2366,6 +2736,28 @@ class MainWindow(QMainWindow):
             # Detection settings
             if 'confidence' in settings:
                 self.confidence_slider.setValue(settings['confidence'])
+            if 'box_thickness' in settings:
+                self.box_thickness_slider.setValue(settings['box_thickness'])
+            if 'font_size' in settings:
+                self.font_size_slider.setValue(settings['font_size'])
+            if 'font_thickness' in settings:
+                self.font_thickness_slider.setValue(settings['font_thickness'])
+            if 'display_point_mode' in settings:
+                checked = bool(settings['display_point_mode'])
+                self.btn_display_mode.blockSignals(True)
+                self.btn_display_mode.setChecked(checked)
+                self.btn_display_mode.blockSignals(False)
+                self.toggle_display_mode(checked)
+            if 'trail_enabled' in settings:
+                checked = bool(settings['trail_enabled'])
+                self.btn_trail_toggle.blockSignals(True)
+                self.btn_trail_toggle.setChecked(checked)
+                self.btn_trail_toggle.blockSignals(False)
+                self.toggle_trail(checked)
+            if 'max_det' in settings:
+                self.max_det_slider.setValue(settings['max_det'])
+            if 'tracker_age' in settings:
+                self.tracker_age_slider.setValue(settings['tracker_age'])
             
             # Performance settings
             if 'frame_skip' in settings:
@@ -2383,12 +2775,20 @@ class MainWindow(QMainWindow):
                     self.btn_smooth_toggle.setChecked(self.smooth_mode)
                     self.btn_smooth_toggle.blockSignals(False)
                     self.toggle_smooth_mode(self.smooth_mode, self.btn_smooth_toggle)
+            if 'adaptive_fps' in settings and hasattr(self, 'btn_adaptive_fps'):
+                checked = bool(settings['adaptive_fps'])
+                self.btn_adaptive_fps.blockSignals(True)
+                self.btn_adaptive_fps.setChecked(checked)
+                self.btn_adaptive_fps.blockSignals(False)
+                self.toggle_adaptive_fps(checked)
 
             # Mutually-exclusive processing mode
             saved_mode = settings.get('processing_mode', 'standard')
             self._apply_processing_mode(saved_mode, trigger_reload=False)
             
             # Stream settings
+            if 'stream_input' in settings and settings['stream_input']:
+                self.stream_input.setEditText(settings['stream_input'])
             if 'stream_quality' in settings:
                 index = self.stream_quality_combo.findText(settings['stream_quality'])
                 if index >= 0:
@@ -2398,6 +2798,10 @@ class MainWindow(QMainWindow):
                 index = self.video_type_combo.findText(settings['video_type'])
                 if index >= 0:
                     self.video_type_combo.setCurrentIndex(index)
+            last_video_file_path = settings.get('last_video_file_path')
+            if isinstance(last_video_file_path, str) and Path(last_video_file_path).exists():
+                self.video_source = last_video_file_path
+                self.btn_start.setEnabled(True)
             
             # ROI settings
             if 'roi_threshold' in settings:
@@ -2410,8 +2814,29 @@ class MainWindow(QMainWindow):
                 if not self.roi_visible:
                     self.btn_toggle_roi.setChecked(True)
                     self.btn_toggle_roi.setText("👁️ Show")
+            if settings.get('roi_config'):
+                self.roi_manager.load_config(settings['roi_config'])
+                self.roi_visible = self.roi_manager.visible
+                self.btn_toggle_roi.blockSignals(True)
+                self.btn_toggle_roi.setChecked(not self.roi_visible)
+                self.btn_toggle_roi.blockSignals(False)
+                self.btn_toggle_roi.setText("Hide" if self.roi_visible else "Show")
+                self.update_roi_status()
+
+            if settings.get('sidebar_visible') is False:
+                self.scroll_area.setVisible(False)
+                self.btn_toggle_sidebar.setText("Show Controls")
+            else:
+                self.scroll_area.setVisible(True)
+                self.btn_toggle_sidebar.setText("Hide Controls")
+            runtime_expanded = settings.get('runtime_expanded', True)
+            self.runtime_toggle_button.blockSignals(True)
+            self.runtime_toggle_button.setChecked(runtime_expanded)
+            self.runtime_toggle_button.blockSignals(False)
+            self.toggle_runtime_section()
             
             self._refresh_custom_model_input()
+            self._refresh_runtime_overview()
             print("✅ Settings loaded")
             
         except Exception as e:
@@ -2455,6 +2880,7 @@ class MainWindow(QMainWindow):
             with open(history_file, 'w', encoding='utf-8') as f:
                 for u in urls:
                     f.write(u + '\n')
+            self.schedule_settings_save()
         except Exception as e:
             print(f"Error saving stream history: {e}")
 

@@ -315,7 +315,7 @@ class VideoProcessorOptimized:
     
     def set_point_mode(self, enabled: bool):
         """Toggle point label mode (compatibility)"""
-        self.point_mode = enabled if hasattr(self, 'point_mode') else False
+        self.point_mode = bool(enabled)
     
     def set_draw_trails(self, enabled: bool):
         """Toggle trail drawing (disabled in Optimized mode)"""

@@ -41,6 +41,12 @@ Thumbs.db
 # Project runtime output
 temp/
 output/
+.codex/
+.kiro/
+.vscode/
+.venv/
+.agent/
+_pycache__/
 
 # Common large model/binary artifacts
 *.pt

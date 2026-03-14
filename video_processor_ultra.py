@@ -51,6 +51,7 @@ class UltraVideoProcessor:
         self.confidence = config.DEFAULT_CONFIDENCE
         self.box_thickness = config.BBOX_THICKNESS
         self.roi_manager = None
+        self.point_mode = True
         
         # FP16 support
         self.use_fp16 = getattr(config, 'USE_FP16', False) and TORCH_AVAILABLE
@@ -59,6 +60,12 @@ class UltraVideoProcessor:
         # Lock-free single-element queue for latest detection results
         self.detection_buffer = deque(maxlen=1)
         self.last_detections = []
+        self.detection_version = 0
+        self.last_consumed_detection_version = -1
+        self.unique_ids = set()
+        self.class_counts_total = {}
+        self.frame_skip = 0
+        self.async_frame_index = 0
         
         # Background inference thread
         self.inference_thread = None
@@ -148,7 +155,8 @@ class UltraVideoProcessor:
                 detections = self._run_inference(frame, resize_scale, max_det)
                 
                 # Store results (lock-free with deque)
-                self.detection_buffer.append(detections)
+                self.detection_version += 1
+                self.detection_buffer.append((self.detection_version, detections))
             except Exception as e:
                 print(f"Inference error: {e}")
     
@@ -238,6 +246,112 @@ class UltraVideoProcessor:
             if self.roi_manager.is_object_in_roi([x1, y1, x1 + w, y1 + h]):
                 filtered.append([bbox, conf, cls_id])
         return filtered
+
+    def _draw_tracks(self, frame: np.ndarray, tracks) -> Dict:
+        """Draw current tracks on a frame and return class counts."""
+        class_counts = {}
+        active_tracks = 0
+
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
+
+            active_tracks += 1
+            track_id = track.track_id
+            ltrb = track.to_ltrb()
+            cls_id = track.det_class
+
+            class_name = self._get_class_name(cls_id)
+            class_counts[class_name] = class_counts.get(class_name, 0) + 1
+            if track_id not in self.unique_ids:
+                self.unique_ids.add(track_id)
+                self.class_counts_total[class_name] = self.class_counts_total.get(class_name, 0) + 1
+
+            color = config.get_class_color(cls_id)
+            center_x = int((ltrb[0] + ltrb[2]) / 2)
+            center_y = int((ltrb[1] + ltrb[3]) / 2)
+            label = f"{class_name} ID:{track_id}"
+
+            if self.point_mode:
+                cv2.circle(frame, (center_x, center_y), 4, color, -1)
+                cv2.circle(frame, (center_x, center_y), 6, (255, 255, 255), 1)
+                cv2.line(frame, (center_x, center_y), (center_x + 24, center_y), color, 1)
+                cv2.putText(
+                    frame,
+                    label,
+                    (center_x + 28, center_y - 4),
+                    self.font,
+                    self.font_scale,
+                    color,
+                    self.font_thickness,
+                )
+            else:
+                cv2.rectangle(
+                    frame,
+                    (int(ltrb[0]), int(ltrb[1])),
+                    (int(ltrb[2]), int(ltrb[3])),
+                    color,
+                    self.box_thickness,
+                )
+                cv2.putText(
+                    frame,
+                    label,
+                    (int(ltrb[0]), int(ltrb[1]) - 5),
+                    self.font,
+                    self.font_scale,
+                    color,
+                    self.font_thickness,
+                )
+
+        return {
+            'active_objects': active_tracks,
+            'active_class_counts': class_counts,
+            'total_objects': len(self.unique_ids),
+            'class_counts': self.class_counts_total.copy(),
+        }
+
+    def process_frame_threaded(self, frame: np.ndarray, resize_scale: int = 100, max_det: int = 20) -> Tuple[np.ndarray, Dict]:
+        """
+        Async frame processing for smoother playback.
+
+        The current frame is displayed immediately while inference runs on the
+        most recent pending frame in the background. Tracking uses the latest
+        available detections instead of blocking the render loop.
+        """
+        if not self.inference_running:
+            self.start_async_inference()
+
+        self.async_frame_index += 1
+        should_submit = (
+            self.frame_skip <= 0
+            or self.async_frame_index % (self.frame_skip + 1) == 0
+            or self.last_consumed_detection_version < 0
+        )
+        if should_submit:
+            with self.frame_lock:
+                self.pending_frame = frame.copy()
+                self.pending_params = (resize_scale, max_det)
+
+        detections = []
+        if self.detection_buffer:
+            version, latest_detections = self.detection_buffer[-1]
+            if version != self.last_consumed_detection_version:
+                self.last_consumed_detection_version = version
+                self.last_detections = latest_detections
+                detections = self._filter_roi_detections(latest_detections)
+
+        try:
+            tracks = self.tracker.update_tracks(detections, frame=frame)
+        except Exception:
+            tracks = self.tracker.update_tracks(detections) if detections else []
+
+        stats = self._draw_tracks(frame, tracks)
+
+        self.frame_counter += 1
+        if self.frame_counter % self.cleanup_interval == 0:
+            self._cleanup()
+
+        return frame, stats
     
     def process_frame(self, frame: np.ndarray, resize_scale: int = 100, max_det: int = 20) -> Tuple[np.ndarray, Dict]:
         """
@@ -252,32 +366,14 @@ class UltraVideoProcessor:
         # Tracking with CURRENT frame detections
         tracks = self.tracker.update_tracks(detections, frame=frame) if detections else []
         
-        # Fast drawing
-        class_counts = {}
-        for track in tracks:
-            if not track.is_confirmed():
-                continue
-            
-            track_id = track.track_id
-            ltrb = track.to_ltrb()
-            cls_id = track.det_class
-            
-            class_name = self._get_class_name(cls_id)
-            class_counts[class_name] = class_counts.get(class_name, 0) + 1
-            
-            color = config.get_class_color(cls_id)
-            
-            cv2.rectangle(frame, (int(ltrb[0]), int(ltrb[1])), (int(ltrb[2]), int(ltrb[3])), color, self.box_thickness)
-            # Full label with class name + ID
-            label = f"{class_name} ID:{track_id}"
-            cv2.putText(frame, label, (int(ltrb[0]), int(ltrb[1]) - 5), self.font, self.font_scale, color, self.font_thickness)
+        stats = self._draw_tracks(frame, tracks)
         
         # Periodic cleanup
         self.frame_counter += 1
         if self.frame_counter % self.cleanup_interval == 0:
             self._cleanup()
         
-        return frame, {'total_objects': len(tracks), 'class_counts': class_counts}
+        return frame, stats
     
     def _cleanup(self):
         """Periodic memory cleanup"""
@@ -318,14 +414,23 @@ class UltraVideoProcessor:
     def reset_statistics(self):
         self.last_detections = []
         self.detection_buffer.clear()
+        self.detection_version = 0
+        self.last_consumed_detection_version = -1
+        self.unique_ids.clear()
+        self.class_counts_total.clear()
+        self.async_frame_index = 0
         self.frame_counter = 0
     
     def set_roi_manager(self, roi_manager):
         self.roi_manager = roi_manager
     
     def set_point_mode(self, enabled: bool):
-        """Toggle point label mode (compatibility - not used in Ultra mode)"""
-        self.point_mode = enabled if hasattr(self, 'point_mode') else False
+        """Toggle point label mode."""
+        self.point_mode = bool(enabled)
+
+    def set_frame_skip(self, frame_skip: int):
+        """Use frame skip as inference stride, not display skip."""
+        self.frame_skip = max(0, int(frame_skip))
     
     def set_draw_trails(self, enabled: bool):
         """Toggle trail drawing (disabled in Ultra mode for speed)"""
