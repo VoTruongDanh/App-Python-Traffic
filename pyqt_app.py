@@ -105,6 +105,7 @@ class VideoThread(QThread):
         last_processed_frame = None
         last_success_time = time.time()
         consecutive_failures = 0
+        source_frame_index = 0
         
         # FRAME PACING: keep output on a fixed cadence to avoid bursty playback.
         source_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -118,6 +119,7 @@ class VideoThread(QThread):
         
         # Detect source type for pacing
         is_livestream = is_rtsp or (isinstance(self.source, str) and ('http' in self.source or 'https' in self.source))
+        playback_clock_start = time.perf_counter()
 
         def pace_output():
             """
@@ -138,10 +140,41 @@ class VideoThread(QThread):
             sleep_time = next_emit_deadline - now
             if sleep_time > 0:
                 time.sleep(sleep_time)
+
+        def sync_file_source_to_clock():
+            """
+            Keep file playback at 1x. If processing falls behind, drop decoded
+            frames so the next rendered frame matches the media clock instead of
+            slowing the whole video down.
+            """
+            nonlocal source_frame_index, playback_clock_start
+
+            if is_livestream or source_fps <= 0:
+                return
+
+            elapsed = time.perf_counter() - playback_clock_start
+            target_frame_index = int(elapsed * source_fps)
+            frames_to_drop = max(0, target_frame_index - source_frame_index)
+            if frames_to_drop <= 0:
+                return
+
+            frames_to_drop = min(frames_to_drop, max(1, int(source_fps)))
+            dropped = 0
+            while dropped < frames_to_drop and cap.grab():
+                source_frame_index += 1
+                dropped += 1
+
+            # If decode could not keep up, realign the wall clock to the source.
+            if dropped == 0 and frames_to_drop > 0:
+                playback_clock_start = time.perf_counter() - (source_frame_index / source_fps)
         
         try:
             while self.running:
                 processor_supports_async = hasattr(self.processor, 'process_frame_threaded')
+                supports_tracking_only = hasattr(self.processor, 'process_frame_tracking_only')
+                loop_lag = time.perf_counter() - next_emit_deadline
+
+                sync_file_source_to_clock()
 
                 # For RTSP, always grab latest frame (discard buffered frames)
                 if is_rtsp:
@@ -152,6 +185,9 @@ class VideoThread(QThread):
                     cap.grab()
                 
                 ret, frame = cap.read()
+                if ret:
+                    source_frame_index += 1
+                    loop_lag = time.perf_counter() - next_emit_deadline
                 
                 if not ret:
                     consecutive_failures += 1
@@ -203,24 +239,39 @@ class VideoThread(QThread):
                 last_success_time = time.time()
                 frame_count += 1
 
+                use_tracking_only = False
+
                 # Apply frame-skip before expensive processing
                 if self.frame_skip > 0 and not processor_supports_async:
                     skip_counter = (skip_counter + 1) % (self.frame_skip + 1)
                     if skip_counter != 0:
-                        if self.smooth_mode and last_processed_frame is not None:
-                            self.frame_ready.emit(last_processed_frame, self._last_stats)
-                        else:
-                            self.frame_ready.emit(frame, self._last_stats)
-                        pace_output()
-                        continue
+                        use_tracking_only = supports_tracking_only
+                        if not use_tracking_only:
+                            if self.smooth_mode and last_processed_frame is not None:
+                                self.frame_ready.emit(last_processed_frame, self._last_stats)
+                            else:
+                                self.frame_ready.emit(frame, self._last_stats)
+                            pace_output()
+                            continue
+
+                # Keep playback at 1x even when full inference cannot keep up.
+                # When late, fall back to a cheap tracker-only overlay pass until
+                # the wall clock is back under control.
+                if (
+                    not processor_supports_async
+                    and supports_tracking_only
+                    and loop_lag > (frame_interval * 0.65)
+                ):
+                    use_tracking_only = True
                 
                 # OPTIMIZED: Process current frame directly (no buffer delay)
                 # Old buffer logic caused 2-3 frame delay
                 process_frame = frame
                 
                 try:
-                    # Check if using threaded processor
-                    if hasattr(self.processor, 'process_frame_threaded'):
+                    if use_tracking_only:
+                        processed_frame, stats = self.processor.process_frame_tracking_only(process_frame)
+                    elif hasattr(self.processor, 'process_frame_threaded'):
                         processed_frame, stats = self.processor.process_frame_threaded(process_frame, self.resize_scale, self.max_det)
                     else:
                         processed_frame, stats = self.processor.process_frame(process_frame, self.resize_scale, self.max_det)

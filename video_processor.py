@@ -16,6 +16,22 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 
+class _TrackSnapshot:
+    """Lightweight track adapter used for cached or tracker-only rendering."""
+
+    def __init__(self, track_id, bbox, cls_id, confirmed=True):
+        self.track_id = track_id
+        self._bbox = bbox
+        self.det_class = cls_id
+        self._confirmed = confirmed
+
+    def to_ltrb(self):
+        return self._bbox
+
+    def is_confirmed(self):
+        return self._confirmed
+
+
 class VideoProcessor:
     """Class xử lý video với dual-model ensemble và tracking"""
     
@@ -59,12 +75,24 @@ class VideoProcessor:
         self.person_classifier = PersonClassifier(iou_threshold=0.3)
         # Per-frame cache to avoid duplicate person classification work
         self._frame_person_types = {}
+        self.last_stats_snapshot = {
+            'active_objects': 0,
+            'active_class_counts': {},
+            'total_objects': 0,
+            'class_counts': {},
+        }
     
     def reset_statistics(self):
         """Reset tất cả statistics"""
         self.unique_ids.clear()
         self.class_counts.clear()
         self.trails.clear()
+        self.last_stats_snapshot = {
+            'active_objects': 0,
+            'active_class_counts': {},
+            'total_objects': 0,
+            'class_counts': {},
+        }
     
     def set_confidence(self, confidence: float):
         """
@@ -332,8 +360,22 @@ class VideoProcessor:
         processed_frame = self._draw_detections(frame, tracks)
         
         # Update statistics
-        stats = self._update_statistics(tracks)
+        stats = self._build_stats_payload(tracks)
         
+        return processed_frame, stats
+
+    def process_frame_tracking_only(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict]:
+        """
+        Reuse the latest tracker state and draw cached overlays without running
+        detector inference. This keeps playback close to 1x when inference
+        falls behind wall-clock time.
+        """
+        self.frame_counter += 1
+        self._frame_person_types = {}
+
+        tracks = self._get_render_tracks()
+        processed_frame = self._draw_detections(frame, tracks)
+        stats = self._build_stats_payload(tracks, update_totals=False)
         return processed_frame, stats
     
     def _filter_overlapping_detections(self, detections, iou_threshold=0.7):
@@ -626,6 +668,91 @@ class VideoProcessor:
             'total_objects': len(self.unique_ids),
             'class_counts': self.class_counts.copy()
         }
+
+    def _build_stats_payload(self, tracks, update_totals=True) -> Dict:
+        """Build both live-frame and session stats in one payload."""
+        active_objects, active_class_counts = self._summarize_active_tracks(tracks)
+        if update_totals:
+            totals = self._update_statistics(tracks)
+        else:
+            totals = {
+                'total_objects': len(self.unique_ids),
+                'class_counts': self.class_counts.copy(),
+            }
+
+        self.last_stats_snapshot = {
+            'active_objects': active_objects,
+            'active_class_counts': active_class_counts,
+            'total_objects': totals['total_objects'],
+            'class_counts': totals['class_counts'],
+        }
+        return self.last_stats_snapshot.copy()
+
+    def _summarize_active_tracks(self, tracks) -> Tuple[int, Dict[str, int]]:
+        """Count current visible tracks without mutating session totals."""
+        active_objects = 0
+        active_class_counts: Dict[str, int] = {}
+        vehicle_tracks = []
+        person_tracks = []
+
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
+
+            ltrb = track.to_ltrb()
+            cls_id = track.det_class
+
+            if self.roi_manager and self.roi_manager.is_active():
+                bbox = [ltrb[0], ltrb[1], ltrb[2], ltrb[3]]
+                if not self.roi_manager.is_object_in_roi(bbox):
+                    continue
+
+            active_objects += 1
+            if cls_id == config.PERSON_CLASS:
+                person_tracks.append((track.track_id, ltrb))
+            else:
+                vehicle_tracks.append((track.track_id, ltrb, cls_id))
+                class_name = self._get_class_name(cls_id)
+                active_class_counts[class_name] = active_class_counts.get(class_name, 0) + 1
+
+        vehicle_bboxes = [(v_ltrb, v_cls_id) for _, v_ltrb, v_cls_id in vehicle_tracks]
+        for track_id, ltrb in person_tracks:
+            person_type = self._frame_person_types.get(track_id)
+            if person_type is None:
+                person_type = self.person_classifier.classify_person(
+                    [ltrb[0], ltrb[1], ltrb[2], ltrb[3]],
+                    track_id,
+                    vehicle_bboxes,
+                    self.frame_counter
+                )
+            active_class_counts[person_type] = active_class_counts.get(person_type, 0) + 1
+
+        return active_objects, active_class_counts
+
+    def _get_render_tracks(self):
+        """Return live tracker objects or lightweight snapshots for drawing."""
+        if hasattr(self.tracker, 'tracks'):
+            return list(self.tracker.tracks)
+
+        if hasattr(self.tracker, 'trackers'):
+            render_tracks = []
+            max_staleness = max(1, min(2, getattr(self.tracker, 'max_age', 1)))
+            for tracker in getattr(self.tracker, 'trackers', []):
+                if getattr(tracker, 'time_since_update', 0) > max_staleness:
+                    continue
+                if not hasattr(tracker, 'get_state'):
+                    continue
+                bbox = tracker.get_state()[0]
+                render_tracks.append(
+                    _TrackSnapshot(
+                        getattr(tracker, 'id', -1),
+                        bbox,
+                        getattr(tracker, 'det_class', config.PERSON_CLASS),
+                    )
+                )
+            return render_tracks
+
+        return []
     
     def _draw_detections_old(self, frame: np.ndarray, tracks) -> np.ndarray:
         """
