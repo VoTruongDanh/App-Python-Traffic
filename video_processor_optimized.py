@@ -10,6 +10,7 @@ Key optimizations:
 import cv2
 import numpy as np
 from typing import Tuple, Dict, Optional
+from contextlib import nullcontext
 import config
 
 # Try to import torch for FP16 support
@@ -58,6 +59,11 @@ class VideoProcessorOptimized:
         # Frame counter for periodic cleanup
         self.frame_counter = 0
         self.cleanup_interval = 30
+
+    def _inference_context(self):
+        if TORCH_AVAILABLE:
+            return torch.inference_mode()
+        return nullcontext()
     
     def _detect_train2(self) -> bool:
         """Detect if using Train2 multi-class model"""
@@ -70,6 +76,22 @@ class VideoProcessorOptimized:
             except:
                 pass
         return False
+
+    def _get_shared_model_names(self) -> dict:
+        """Return native class names when one detector is shared."""
+        if self.model_person is not self.model_vehicle:
+            return {}
+
+        try:
+            names = getattr(self.model_person, 'names', {})
+            if isinstance(names, dict):
+                return {int(k): str(v) for k, v in names.items()}
+            if isinstance(names, list):
+                return {idx: str(name) for idx, name in enumerate(names)}
+        except Exception:
+            pass
+
+        return {}
     
     def _batch_extract_detections(self, results, scale_factor: float) -> list:
         """
@@ -116,6 +138,18 @@ class VideoProcessorOptimized:
             w, h = x2 - x1, y2 - y1
             detections.append([[x1, y1, w, h], conf, cls_id])
         return detections
+
+    def _filter_roi_detections(self, detections: list) -> list:
+        """Apply ROI filtering before tracking."""
+        if not self.roi_manager or not self.roi_manager.is_active():
+            return detections
+
+        filtered = []
+        for bbox, conf, cls_id in detections:
+            x1, y1, w, h = bbox
+            if self.roi_manager.is_object_in_roi([x1, y1, x1 + w, y1 + h]):
+                filtered.append([bbox, conf, cls_id])
+        return filtered
     
     def process_frame(self, frame: np.ndarray, resize_scale: int = 100, max_det: int = 20) -> Tuple[np.ndarray, Dict]:
         """
@@ -150,11 +184,13 @@ class VideoProcessorOptimized:
             inference_kwargs['half'] = True
         
         # Single or dual model inference
-        if self.using_train2 or (self.model_person is self.model_vehicle):
-            results = self.model_person(inference_frame, **inference_kwargs)[0]
-            detections = self._batch_extract_detections(results, scale_factor)
-        else:
-            detections = self._dual_model_inference(inference_frame, scale_factor, max_det, inference_kwargs)
+        with self._inference_context():
+            if self.using_train2 or (self.model_person is self.model_vehicle):
+                results = self.model_person(inference_frame, **inference_kwargs)[0]
+                detections = self._batch_extract_detections(results, scale_factor)
+            else:
+                detections = self._dual_model_inference(inference_frame, scale_factor, max_det, inference_kwargs)
+        detections = self._filter_roi_detections(detections)
         
         # Fast tracking
         tracks = self.tracker.update_tracks(detections, frame=frame) if detections else []
@@ -174,7 +210,7 @@ class VideoProcessorOptimized:
             class_counts[class_name] = class_counts.get(class_name, 0) + 1
             
             # Fast draw with pre-computed values
-            color = self.color_person if cls_id == config.PERSON_CLASS else self.color_vehicle
+            color = config.get_class_color(cls_id)
             
             # Draw rectangle
             cv2.rectangle(
@@ -244,6 +280,9 @@ class VideoProcessorOptimized:
     
     def _get_class_name(self, cls_id: int) -> str:
         """Get class name from ID"""
+        shared_names = self._get_shared_model_names()
+        if shared_names:
+            return shared_names.get(cls_id, f"Class {cls_id}")
         if self.using_train2:
             return config.TRAIN2_CLASSES.get(cls_id, 'Unknown')
         return config.CLASS_NAMES.get(cls_id, 'Unknown')

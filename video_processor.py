@@ -4,9 +4,16 @@ Video Processor - Core logic xử lý video với YOLOv3 + DeepSort
 import cv2
 import numpy as np
 from typing import Tuple, Dict, Set, List
+from contextlib import nullcontext
 from PIL import Image, ImageDraw, ImageFont
 import config
 from person_classifier import PersonClassifier
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 
 class VideoProcessor:
@@ -50,6 +57,8 @@ class VideoProcessor:
         
         # Person classifier
         self.person_classifier = PersonClassifier(iou_threshold=0.3)
+        # Per-frame cache to avoid duplicate person classification work
+        self._frame_person_types = {}
     
     def reset_statistics(self):
         """Reset tất cả statistics"""
@@ -134,6 +143,22 @@ class VideoProcessor:
             except Exception:
                 pass
         return False
+
+    def _get_shared_model_names(self) -> Dict[int, str]:
+        """Return native class names when a single shared model is in use."""
+        if self.model_person is not self.model_vehicle:
+            return {}
+
+        try:
+            names = getattr(self.model_person, 'names', {})
+            if isinstance(names, dict):
+                return {int(k): str(v) for k, v in names.items()}
+            if isinstance(names, list):
+                return {idx: str(name) for idx, name in enumerate(names)}
+        except Exception:
+            pass
+
+        return {}
     
     def _get_class_name(self, cls_id: int) -> str:
         """
@@ -145,10 +170,56 @@ class VideoProcessor:
         Returns:
             Class name string
         """
+        shared_names = self._get_shared_model_names()
+        if shared_names:
+            return shared_names.get(cls_id, f"Class {cls_id}")
         if self.using_train2:
             return config.TRAIN2_CLASSES.get(cls_id, 'Unknown')
         else:
             return config.CLASS_NAMES.get(cls_id, 'Unknown')
+
+    def _inference_context(self):
+        """Run model inference without autograd overhead when torch is available."""
+        if TORCH_AVAILABLE:
+            return torch.inference_mode()
+        return nullcontext()
+
+    def _extract_detections_batch(self, results, scale_factor: float, class_override: int = None) -> List:
+        """
+        Extract detections with a batched tensor transfer when possible.
+        Falls back to per-box extraction for non-standard result wrappers.
+        """
+        boxes = results.boxes
+        if len(boxes) == 0:
+            return []
+
+        try:
+            xyxy = boxes.xyxy.cpu().numpy()
+            confs = boxes.conf.cpu().numpy()
+            cls_ids = boxes.cls.cpu().numpy().astype(np.int32)
+
+            if scale_factor != 1.0:
+                xyxy[:, [0, 2]] /= scale_factor
+                xyxy[:, [1, 3]] /= scale_factor
+
+            detections = []
+            for i in range(len(xyxy)):
+                x1, y1, x2, y2 = xyxy[i]
+                w, h = x2 - x1, y2 - y1
+                cls_id = class_override if class_override is not None else int(cls_ids[i])
+                detections.append([[x1, y1, w, h], float(confs[i]), cls_id])
+            return detections
+        except Exception:
+            detections = []
+            for box in boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                x1, x2 = x1 / scale_factor, x2 / scale_factor
+                y1, y2 = y1 / scale_factor, y2 / scale_factor
+                conf = float(box.conf[0].cpu().numpy())
+                cls_id = class_override if class_override is not None else int(box.cls[0].cpu().numpy())
+                w, h = x2 - x1, y2 - y1
+                detections.append([[x1, y1, w, h], conf, cls_id])
+            return detections
     
     def process_frame(self, frame: np.ndarray, resize_scale: int = 100, max_det: int = 20) -> Tuple[np.ndarray, Dict]:
         """
@@ -159,8 +230,9 @@ class VideoProcessor:
             resize_scale: Resize scale percentage (25, 50, 75, 100)
             max_det: Maximum detections per frame
         """
-        # Periodic cleanup to prevent memory leak
+        # Periodic cleanup to prevent memory growth without stalling inference
         self.frame_counter += 1
+        self._frame_person_types = {}
         if self.frame_counter % self.cleanup_interval == 0:
             # Force cleanup tracker
             if hasattr(self.tracker, 'tracks'):
@@ -173,18 +245,11 @@ class VideoProcessor:
                 trail_ids = list(self.trails.keys())
                 for old_id in trail_ids[:-20]:
                     del self.trails[old_id]
-            
-            # Force garbage collection every 100 frames (tăng tần suất)
+
+        # Lightweight full GC less frequently to avoid frame spikes
+        if self.frame_counter % (self.cleanup_interval * 12) == 0:
             import gc
             gc.collect()
-            
-            # Clear CUDA cache if using GPU
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except:
-                pass
         
         # AGGRESSIVE: Full reset every 1000 frames
         if self.frame_counter % 1000 == 0:
@@ -197,13 +262,6 @@ class VideoProcessor:
             # Force full GC
             import gc
             gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-            except:
-                pass
         
         # Store original size
         orig_h, orig_w = frame.shape[:2]
@@ -219,91 +277,50 @@ class VideoProcessor:
             scale_factor = 1.0
         
         detections = []
-        
-        # Check if using Train2 model (single model for all classes)
-        if self.using_train2:
-            # Train2: Single model detects all classes
-            results = self.model_person(
-                inference_frame,  # Use resized frame
-                conf=self.confidence,
-                iou=0.6,
-                verbose=False,
-                max_det=max_det  # Use dynamic max_det
-            )[0]
-            
-            for box in results.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                # Scale back to original size
-                x1, x2 = x1 / scale_factor, x2 / scale_factor
-                y1, y2 = y1 / scale_factor, y2 / scale_factor
-                conf = float(box.conf[0].cpu().numpy())
-                cls_id = int(box.cls[0].cpu().numpy())
-                w, h = x2 - x1, y2 - y1
-                detections.append([[x1, y1, w, h], conf, cls_id])
-        
-        # Single-pass detection if same model (base YOLO)
-        elif self.model_person is self.model_vehicle:
-            all_classes = [config.PERSON_CLASS] + config.VEHICLE_CLASSES
-            results = self.model_person(
-                inference_frame,  # Use resized frame
-                conf=self.confidence,
-                iou=0.6,
-                verbose=False,
-                classes=all_classes,
-                max_det=max_det  # Use dynamic max_det
-            )[0]
-            
-            for box in results.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                # Scale back to original size
-                x1, x2 = x1 / scale_factor, x2 / scale_factor
-                y1, y2 = y1 / scale_factor, y2 / scale_factor
-                conf = float(box.conf[0].cpu().numpy())
-                cls_id = int(box.cls[0].cpu().numpy())
-                w, h = x2 - x1, y2 - y1
-                detections.append([[x1, y1, w, h], conf, cls_id])
-        else:
-            # Separate detection for person
-            max_det_person = max(5, max_det // 2)  # Split max_det
-            max_det_vehicle = max(5, max_det // 2)
-            
-            results_person = self.model_person(
-                inference_frame,  # Use resized frame
-                conf=self.confidence,
-                iou=0.6,
-                verbose=False, 
-                classes=[config.PERSON_CLASS],
-                max_det=max_det_person
-            )[0]
-            
-            for box in results_person.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                # Scale back to original size
-                x1, x2 = x1 / scale_factor, x2 / scale_factor
-                y1, y2 = y1 / scale_factor, y2 / scale_factor
-                conf = float(box.conf[0].cpu().numpy())
-                w, h = x2 - x1, y2 - y1
-                detections.append([[x1, y1, w, h], conf, config.PERSON_CLASS])
-            
-            # Separate detection for vehicles
-            results_vehicle = self.model_vehicle(
-                inference_frame,  # Use resized frame
-                conf=self.confidence,
-                iou=0.6,
-                verbose=False,
-                classes=config.VEHICLE_CLASSES,
-                max_det=max_det_vehicle
-            )[0]
-            
-            for box in results_vehicle.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                # Scale back to original size
-                x1, x2 = x1 / scale_factor, x2 / scale_factor
-                y1, y2 = y1 / scale_factor, y2 / scale_factor
-                conf = float(box.conf[0].cpu().numpy())
-                cls_id = int(box.cls[0].cpu().numpy())
-                w, h = x2 - x1, y2 - y1
-                detections.append([[x1, y1, w, h], conf, cls_id])
+
+        with self._inference_context():
+            # Single shared model path: custom detectors and Train2 should run
+            # once and keep their native class IDs from the model itself.
+            if self.model_person is self.model_vehicle:
+                results = self.model_person(
+                    inference_frame,  # Use resized frame
+                    conf=self.confidence,
+                    iou=0.6,
+                    verbose=False,
+                    max_det=max_det  # Use dynamic max_det
+                )[0]
+                detections = self._extract_detections_batch(results, scale_factor)
+            else:
+                # Separate detection for person
+                max_det_person = max(5, max_det // 2)  # Split max_det
+                max_det_vehicle = max(5, max_det // 2)
+
+                results_person = self.model_person(
+                    inference_frame,  # Use resized frame
+                    conf=self.confidence,
+                    iou=0.6,
+                    verbose=False,
+                    classes=[config.PERSON_CLASS],
+                    max_det=max_det_person
+                )[0]
+                detections.extend(
+                    self._extract_detections_batch(
+                        results_person,
+                        scale_factor,
+                        class_override=config.PERSON_CLASS
+                    )
+                )
+
+                # Separate detection for vehicles
+                results_vehicle = self.model_vehicle(
+                    inference_frame,  # Use resized frame
+                    conf=self.confidence,
+                    iou=0.6,
+                    verbose=False,
+                    classes=config.VEHICLE_CLASSES,
+                    max_det=max_det_vehicle
+                )[0]
+                detections.extend(self._extract_detections_batch(results_vehicle, scale_factor))
         
         # Filter overlapping detections (additional NMS for cross-class)
         detections = self._filter_overlapping_detections(detections)
@@ -407,6 +424,7 @@ class VideoProcessor:
                 vehicle_bboxes,
                 self.frame_counter
             )
+            self._frame_person_types[track_id] = person_type
             
             # Choose color based on person type
             if person_type == "Pedestrian":
@@ -422,7 +440,7 @@ class VideoProcessor:
         # Third pass: draw vehicles
         for track, ltrb, cls_id in vehicle_tracks:
             track_id = track.track_id
-            color = config.COLOR_VEHICLE
+            color = config.get_class_color(cls_id)
             class_name = self._get_class_name(cls_id)
             
             self._draw_single_track(frame, ltrb, track_id, class_name, color)
@@ -555,63 +573,54 @@ class VideoProcessor:
         Cập nhật statistics dựa trên tracks hiện tại
         Đếm riêng Pedestrian và Rider dựa trên classification đầu tiên
         """
-        # Collect vehicle tracks for classification
         vehicle_tracks = []
         person_tracks = []
-        
+
         for track in tracks:
             if not track.is_confirmed():
                 continue
-            
+
             track_id = track.track_id
             cls_id = track.det_class
             ltrb = track.to_ltrb()
-            
+
             # ROI filtering - only count if in ROI
             if self.roi_manager and self.roi_manager.is_active():
                 bbox = [ltrb[0], ltrb[1], ltrb[2], ltrb[3]]
                 if not self.roi_manager.is_object_in_roi(bbox):
                     continue
-            
-            # Separate person and vehicle
-            if cls_id == 0:  # Person
+
+            if cls_id == config.PERSON_CLASS:
                 person_tracks.append((track_id, ltrb))
-            else:  # Vehicle
-                vehicle_tracks.append((ltrb, cls_id))
-        
-        # Process person tracks with classification
+            else:
+                vehicle_tracks.append((track_id, ltrb, cls_id))
+
+        # Count vehicles (single pass, O(n))
+        for track_id, _, cls_id in vehicle_tracks:
+            if track_id in self.unique_ids:
+                continue
+            self.unique_ids.add(track_id)
+            class_name = self._get_class_name(cls_id)
+            self.class_counts[class_name] = self.class_counts.get(class_name, 0) + 1
+
+        # Count persons (reuse cached classification from drawing pass when available)
+        vehicle_bboxes = [(v_ltrb, v_cls_id) for _, v_ltrb, v_cls_id in vehicle_tracks]
         for track_id, ltrb in person_tracks:
-            # Đếm ID mới
-            if track_id not in self.unique_ids:
-                self.unique_ids.add(track_id)
-                
-                # Classify person to determine if Pedestrian or Rider
+            if track_id in self.unique_ids:
+                continue
+
+            self.unique_ids.add(track_id)
+            person_type = self._frame_person_types.get(track_id)
+            if person_type is None:
                 person_type = self.person_classifier.classify_person(
                     [ltrb[0], ltrb[1], ltrb[2], ltrb[3]],
                     track_id,
-                    vehicle_tracks,
+                    vehicle_bboxes,
                     self.frame_counter
                 )
-                
-                # Count based on first classification
-                # This ensures we only count once even if classification changes
-                self.class_counts[person_type] = self.class_counts.get(person_type, 0) + 1
-        
-        # Process vehicle tracks
-        for ltrb, cls_id in vehicle_tracks:
-            # Find track_id for this vehicle
-            for track in tracks:
-                if track.det_class == cls_id:
-                    track_ltrb = track.to_ltrb()
-                    if (abs(track_ltrb[0] - ltrb[0]) < 1 and 
-                        abs(track_ltrb[1] - ltrb[1]) < 1):
-                        track_id = track.track_id
-                        
-                        if track_id not in self.unique_ids:
-                            self.unique_ids.add(track_id)
-                            class_name = self._get_class_name(cls_id)
-                            self.class_counts[class_name] = self.class_counts.get(class_name, 0) + 1
-                        break
+
+            # Count based on first classification to avoid double counting track changes
+            self.class_counts[person_type] = self.class_counts.get(person_type, 0) + 1
         
         return {
             'total_objects': len(self.unique_ids),

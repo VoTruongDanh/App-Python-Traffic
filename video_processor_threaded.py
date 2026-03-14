@@ -111,86 +111,50 @@ class ThreadedVideoProcessor(VideoProcessor):
             scale_factor = 1.0
         
         detections = []
-        
-        # Check if using Train2 model
-        if self.using_train2:
-            results = self.model_person(
-                inference_frame,
-                conf=self.confidence,
-                iou=0.6,
-                verbose=False,
-                max_det=max_det
-            )[0]
-            
-            for box in results.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                x1, x2 = x1 / scale_factor, x2 / scale_factor
-                y1, y2 = y1 / scale_factor, y2 / scale_factor
-                conf = float(box.conf[0].cpu().numpy())
-                cls_id = int(box.cls[0].cpu().numpy())
-                w, h = x2 - x1, y2 - y1
-                detections.append([[x1, y1, w, h], conf, cls_id])
-        
-        elif self.model_person is self.model_vehicle:
-            import config
-            all_classes = [config.PERSON_CLASS] + config.VEHICLE_CLASSES
-            results = self.model_person(
-                inference_frame,
-                conf=self.confidence,
-                iou=0.6,
-                verbose=False,
-                classes=all_classes,
-                max_det=max_det
-            )[0]
-            
-            for box in results.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                x1, x2 = x1 / scale_factor, x2 / scale_factor
-                y1, y2 = y1 / scale_factor, y2 / scale_factor
-                conf = float(box.conf[0].cpu().numpy())
-                cls_id = int(box.cls[0].cpu().numpy())
-                w, h = x2 - x1, y2 - y1
-                detections.append([[x1, y1, w, h], conf, cls_id])
-        else:
-            # Dual model
-            import config
-            max_det_person = max(5, max_det // 2)
-            max_det_vehicle = max(5, max_det // 2)
-            
-            results_person = self.model_person(
-                inference_frame,
-                conf=self.confidence,
-                iou=0.6,
-                verbose=False,
-                classes=[config.PERSON_CLASS],
-                max_det=max_det_person
-            )[0]
-            
-            for box in results_person.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                x1, x2 = x1 / scale_factor, x2 / scale_factor
-                y1, y2 = y1 / scale_factor, y2 / scale_factor
-                conf = float(box.conf[0].cpu().numpy())
-                w, h = x2 - x1, y2 - y1
-                detections.append([[x1, y1, w, h], conf, config.PERSON_CLASS])
-            
-            results_vehicle = self.model_vehicle(
-                inference_frame,
-                conf=self.confidence,
-                iou=0.6,
-                verbose=False,
-                classes=config.VEHICLE_CLASSES,
-                max_det=max_det_vehicle
-            )[0]
-            
-            for box in results_vehicle.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                x1, x2 = x1 / scale_factor, x2 / scale_factor
-                y1, y2 = y1 / scale_factor, y2 / scale_factor
-                conf = float(box.conf[0].cpu().numpy())
-                cls_id = int(box.cls[0].cpu().numpy())
-                w, h = x2 - x1, y2 - y1
-                detections.append([[x1, y1, w, h], conf, cls_id])
+
+        with self._inference_context():
+            # Shared detector path: custom and Train2 models should run once and
+            # keep their native class IDs.
+            if self.model_person is self.model_vehicle:
+                results = self.model_person(
+                    inference_frame,
+                    conf=self.confidence,
+                    iou=0.6,
+                    verbose=False,
+                    max_det=max_det
+                )[0]
+                detections = self._extract_detections_batch(results, scale_factor)
+            else:
+                # Dual model
+                import config
+                max_det_person = max(5, max_det // 2)
+                max_det_vehicle = max(5, max_det // 2)
+
+                results_person = self.model_person(
+                    inference_frame,
+                    conf=self.confidence,
+                    iou=0.6,
+                    verbose=False,
+                    classes=[config.PERSON_CLASS],
+                    max_det=max_det_person
+                )[0]
+                detections.extend(
+                    self._extract_detections_batch(
+                        results_person,
+                        scale_factor,
+                        class_override=config.PERSON_CLASS
+                    )
+                )
+
+                results_vehicle = self.model_vehicle(
+                    inference_frame,
+                    conf=self.confidence,
+                    iou=0.6,
+                    verbose=False,
+                    classes=config.VEHICLE_CLASSES,
+                    max_det=max_det_vehicle
+                )[0]
+                detections.extend(self._extract_detections_batch(results_vehicle, scale_factor))
         
         return detections
     

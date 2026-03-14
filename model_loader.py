@@ -4,8 +4,32 @@ Supports both PyTorch (.pt) and ONNX (.onnx) models
 ONNX models provide 2-3x speedup with same quality
 """
 import os
-import streamlit as st
-from ultralytics import YOLO
+import sys
+import builtins
+import importlib
+
+# Prevent OpenMP runtime crashes and thread oversubscription on mixed stacks
+if os.name == "nt":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    # PowerShell can expose the working directory as \\?\D:\..., which some
+    # third-party libs don't handle consistently. Normalize it early.
+    try:
+        _cwd = os.getcwd()
+        if _cwd.startswith("\\\\?\\"):
+            os.chdir(_cwd[4:])
+    except Exception:
+        pass
+
+# Keep CPU thread pressure bounded for stable real-time latency
+_cpu_count = os.cpu_count() or 4
+_cpu_threads = max(1, min(8, _cpu_count // 2))
+os.environ.setdefault("OMP_NUM_THREADS", str(_cpu_threads))
+os.environ.setdefault("MKL_NUM_THREADS", str(_cpu_threads))
+
+try:
+    import streamlit as st
+except Exception:
+    st = None
 from deep_sort_realtime.deepsort_tracker import DeepSort
 import config
 import torch
@@ -19,6 +43,93 @@ except ImportError:
     ONNX_AVAILABLE = False
     print("⚠️  ONNX Runtime not available - using PyTorch models")
     print("   Install with: pip install onnxruntime-gpu")
+ONNX_CUDA_SESSION_OK = None
+
+try:
+    torch.set_num_threads(_cpu_threads)
+    if hasattr(torch, "set_num_interop_threads"):
+        torch.set_num_interop_threads(max(1, _cpu_threads // 2))
+except Exception:
+    pass
+
+
+def _import_yolo_safely():
+    """
+    Import Ultralytics with a narrow workaround for Windows path edge-cases.
+
+    Some environments surface OSError(22) for '/etc/os-release' during
+    ultralytics import, while ultralytics only expects FileNotFoundError on
+    non-Linux systems. Convert just that case so import can continue.
+    """
+    original_open = builtins.open
+
+    def safe_open(file, *args, **kwargs):
+        try:
+            return original_open(file, *args, **kwargs)
+        except OSError as exc:
+            if file == "/etc/os-release" and getattr(exc, "errno", None) == 22:
+                raise FileNotFoundError(2, "No such file or directory", file) from exc
+            raise
+
+    builtins.open = safe_open
+    try:
+        return importlib.import_module("ultralytics").YOLO
+    finally:
+        builtins.open = original_open
+
+
+YOLO = _import_yolo_safely()
+
+
+def _get_active_app_state():
+    """
+    Return the live app_state without re-importing pyqt_app.
+
+    When `pyqt_app.py` is launched as a script, its module is `__main__`.
+    Importing `pyqt_app` from here would create a second module instance and
+    reset the user's current selection back to defaults.
+    """
+    main_module = sys.modules.get('__main__')
+    if main_module is not None and hasattr(main_module, 'app_state'):
+        return getattr(main_module, 'app_state')
+
+    pyqt_module = sys.modules.get('pyqt_app')
+    if pyqt_module is not None and hasattr(pyqt_module, 'app_state'):
+        return getattr(pyqt_module, 'app_state')
+
+    return None
+
+
+def _tag_model(model, model_path: str):
+    """Attach lightweight metadata used by the PyQt runtime summary."""
+    try:
+        model._loaded_model_path = model_path
+        model._loaded_model_name = os.path.basename(model_path)
+    except Exception:
+        pass
+    return model
+
+
+def _prefer_gpu_sibling_pt(model_path: str, use_gpu: bool = True) -> str:
+    """
+    Prefer a sibling `.pt` file when a custom `.onnx` path would otherwise keep
+    the pipeline on CPU despite CUDA being available for torch.
+    """
+    if not use_gpu or not torch.cuda.is_available():
+        return model_path
+
+    if not model_path.lower().endswith('.onnx'):
+        return model_path
+
+    if ONNX_AVAILABLE and ONNX_CUDA_SESSION_OK is not False:
+        return model_path
+
+    sibling_pt = os.path.splitext(model_path)[0] + '.pt'
+    if os.path.exists(sibling_pt):
+        print(f"[INFO] GPU is available. Prefer sibling PyTorch model for CUDA: {sibling_pt}")
+        return sibling_pt
+
+    return model_path
 
 
 def _load_model(model_path: str, use_gpu: bool = True):
@@ -38,13 +149,61 @@ def _load_model(model_path: str, use_gpu: bool = True):
     if ONNX_AVAILABLE and os.path.exists(onnx_path):
         # Use ONNX for 2-3x speedup
         print(f"🚀 Loading ONNX model: {onnx_path}")
-        return ONNXModel(onnx_path, use_gpu=use_gpu)
+        return _tag_model(ONNXModel(onnx_path, use_gpu=use_gpu), onnx_path)
     else:
         # Fallback to PyTorch
         if ONNX_AVAILABLE:
             print(f"⚠️  ONNX not found, using PyTorch: {model_path}")
             print(f"   Convert with: python UI/convert_models_to_onnx.py")
-        return YOLO(model_path)
+        return _tag_model(YOLO(model_path), model_path)
+
+
+def _load_model_runtime_aware(model_path: str, use_gpu: bool = True):
+    """
+    Load a model and prefer the real GPU path.
+
+    ONNX Runtime on Windows may advertise CUDA support but still fail to load
+    the CUDA provider at session-creation time and silently fall back to CPU.
+    When that happens and torch CUDA is available, PyTorch CUDA is typically
+    faster than ONNX CPU, so prefer the .pt model.
+    """
+    global ONNX_CUDA_SESSION_OK
+
+    if use_gpu and torch.cuda.is_available() and model_path.lower().endswith('.pt'):
+        return _tag_model(YOLO(model_path), model_path)
+
+    if (
+        use_gpu
+        and torch.cuda.is_available()
+        and ONNX_AVAILABLE
+        and ONNX_CUDA_SESSION_OK is False
+        and model_path.lower().endswith('.pt')
+    ):
+        return _tag_model(YOLO(model_path), model_path)
+
+    model = _load_model(model_path, use_gpu=use_gpu)
+
+    if not (use_gpu and torch.cuda.is_available() and ONNX_AVAILABLE):
+        return model
+
+    try:
+        if isinstance(model, ONNXModel):
+            provider = model.session.get_providers()[0]
+            if provider != 'CUDAExecutionProvider':
+                ONNX_CUDA_SESSION_OK = False
+                if model_path.lower().endswith('.pt'):
+                    print(f"[WARN] ONNX provider for {model_path} is {provider}. Falling back to PyTorch CUDA.")
+                    return _tag_model(YOLO(model_path), model_path)
+                sibling_pt = os.path.splitext(model_path)[0] + '.pt'
+                if os.path.exists(sibling_pt):
+                    print(f"[WARN] ONNX provider for {model_path} is {provider}. Falling back to sibling PyTorch CUDA model: {sibling_pt}")
+                    return _tag_model(YOLO(sibling_pt), sibling_pt)
+                print(f"[WARN] ONNX provider for {model_path} is {provider}. Keeping ONNX model because no .pt fallback was requested.")
+            ONNX_CUDA_SESSION_OK = True
+    except Exception as exc:
+        print(f"[WARN] Failed to inspect ONNX provider for {model_path}: {exc}")
+
+    return model
 
 
 def load_yolo_models():
@@ -61,20 +220,21 @@ def load_yolo_models():
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
     
     # Get model choice from session state or app_state (for PyQt5)
-    model_choice = 'YOLOv8n'  # Default
-    best_model_choice = 'Train1 (Person only) - ../best.pt'  # Default
+    model_choice = 'YOLOv26n (Fastest)'  # Default
+    best_model_choice = 'None (Use base YOLO only)'  # Default
     
-    # Try Streamlit session state first
-    if hasattr(st, 'session_state') and 'model_choice' in st.session_state:
-        model_choice = st.session_state.get('model_choice', 'YOLOv8n')
-        best_model_choice = st.session_state.get('best_model_choice', 'Train1 (Person only) - ../best.pt')
-    else:
-        # Try PyQt5 app_state
+    # Prefer the live PyQt state. Importing pyqt_app here would create a new
+    # module instance when pyqt_app.py is launched as a script.
+    active_app_state = _get_active_app_state()
+    if active_app_state is not None:
+        model_choice = getattr(active_app_state, 'model_choice', model_choice)
+        best_model_choice = getattr(active_app_state, 'best_model_choice', best_model_choice)
+    elif st is not None:
         try:
-            from pyqt_app import app_state
-            model_choice = app_state.model_choice
-            best_model_choice = getattr(app_state, 'best_model_choice', 'Train1 (Person only) - ../best.pt')
-        except (ImportError, AttributeError):
+            if st.runtime.exists() and 'model_choice' in st.session_state:
+                model_choice = st.session_state.get('model_choice', 'YOLOv8n')
+                best_model_choice = st.session_state.get('best_model_choice', 'Train1 (Person only) - ../best.pt')
+        except Exception:
             pass
     
     # Map model choice to model file
@@ -88,59 +248,59 @@ def load_yolo_models():
     }
     
     base_model = model_map.get(model_choice, 'yolov8n.pt')
+    print(f"Loading detector selection -> base: {model_choice} | trained: {best_model_choice}")
     
     # Determine which best.pt to use
     if "None" in best_model_choice:
         # No custom model, use base YOLO for everything
-        model_person = _load_model(base_model, use_gpu=config.USE_GPU)
-        model_vehicle = _load_model(base_model, use_gpu=config.USE_GPU)
+        model_person = _load_model_runtime_aware(base_model, use_gpu=config.USE_GPU)
+        model_vehicle = _load_model_runtime_aware(base_model, use_gpu=config.USE_GPU)
         
     elif "Train2" in best_model_choice:
         # Use Train2 best.pt (person, car, bus, truck, motorcycle)
         best_pt_path = '../Train2/best.pt'
         if os.path.exists(best_pt_path):
-            # Train2 model can detect all classes, use it for both
-            model_person = _load_model(best_pt_path, use_gpu=config.USE_GPU)
-            model_vehicle = _load_model(best_pt_path, use_gpu=config.USE_GPU)
+            # Train2 is a single multi-class detector. Reuse one instance so the
+            # processors run one inference pass and keep native class IDs.
+            shared_model = _load_model_runtime_aware(best_pt_path, use_gpu=config.USE_GPU)
+            model_person = shared_model
+            model_vehicle = shared_model
         else:
             # Fallback to base model
             print(f"Warning: Train2 best.pt not found at {best_pt_path}, using base model")
-            model_person = _load_model(base_model, use_gpu=config.USE_GPU)
-            model_vehicle = _load_model(base_model, use_gpu=config.USE_GPU)
+            model_person = _load_model_runtime_aware(base_model, use_gpu=config.USE_GPU)
+            model_vehicle = _load_model_runtime_aware(base_model, use_gpu=config.USE_GPU)
             
     elif "Custom:" in best_model_choice:
         # Use custom model path
         custom_path = best_model_choice.replace("Custom: ", "").strip()
+        custom_path = _prefer_gpu_sibling_pt(custom_path, use_gpu=config.USE_GPU)
         if os.path.exists(custom_path):
-            # Try to detect if it's a multi-class model
             try:
-                temp_model = YOLO(custom_path)
-                # If model has 5 classes, assume it's multi-class like Train2
-                if hasattr(temp_model, 'names') and len(temp_model.names) == 5:
-                    model_person = _load_model(custom_path, use_gpu=config.USE_GPU)
-                    model_vehicle = _load_model(custom_path, use_gpu=config.USE_GPU)
-                else:
-                    # Single class or person-only model
-                    model_person = _load_model(custom_path, use_gpu=config.USE_GPU)
-                    model_vehicle = _load_model(base_model, use_gpu=config.USE_GPU)
+                # A custom detector chosen from the UI should become the active
+                # detector for the whole pipeline instead of being mixed with the
+                # default COCO model.
+                shared_model = _load_model_runtime_aware(custom_path, use_gpu=config.USE_GPU)
+                model_person = shared_model
+                model_vehicle = shared_model
             except Exception as e:
                 print(f"Error loading custom model: {e}, using base model")
-                model_person = _load_model(base_model, use_gpu=config.USE_GPU)
-                model_vehicle = _load_model(base_model, use_gpu=config.USE_GPU)
+                model_person = _load_model_runtime_aware(base_model, use_gpu=config.USE_GPU)
+                model_vehicle = _load_model_runtime_aware(base_model, use_gpu=config.USE_GPU)
         else:
             print(f"Warning: Custom model not found at {custom_path}, using base model")
-            model_person = _load_model(base_model, use_gpu=config.USE_GPU)
-            model_vehicle = _load_model(base_model, use_gpu=config.USE_GPU)
+            model_person = _load_model_runtime_aware(base_model, use_gpu=config.USE_GPU)
+            model_vehicle = _load_model_runtime_aware(base_model, use_gpu=config.USE_GPU)
             
     else:
         # Use Train1 best.pt (person only) + base model for vehicles
         if os.path.exists(config.MODEL_PERSON_PATH):
-            model_person = _load_model(config.MODEL_PERSON_PATH, use_gpu=config.USE_GPU)
+            model_person = _load_model_runtime_aware(config.MODEL_PERSON_PATH, use_gpu=config.USE_GPU)
         else:
-            model_person = _load_model(base_model, use_gpu=config.USE_GPU)
+            model_person = _load_model_runtime_aware(base_model, use_gpu=config.USE_GPU)
         
         # Load Model gốc cho Vehicle
-        model_vehicle = _load_model(base_model, use_gpu=config.USE_GPU)
+        model_vehicle = _load_model_runtime_aware(base_model, use_gpu=config.USE_GPU)
     
     # Set device based on config and availability
     if config.USE_GPU and torch.cuda.is_available():
@@ -151,20 +311,34 @@ def load_yolo_models():
     # Only set device for PyTorch models (ONNX handles device internally)
     if hasattr(model_person, 'to'):
         model_person.to(device)
-    if hasattr(model_vehicle, 'to'):
+    if model_vehicle is not model_person and hasattr(model_vehicle, 'to'):
         model_vehicle.to(device)
     
     return model_person, model_vehicle
 
 
-def initialize_tracker(tracker_type='SORT (Fast) ⭐'):
+def initialize_tracker(tracker_type='SORT (Fast)'):
     """
     Khởi tạo Tracker (SORT hoặc DeepSort) - NO CACHE for PyQt5
     
     Args:
         tracker_type: 'SORT (Fast) ⭐' or 'DeepSort (Stable)'
     """
-    if 'SORT' in tracker_type:
+    tracker_name = (tracker_type or '').lower()
+
+    if 'simple' in tracker_name:
+        try:
+            from simple_tracker import SimpleTracker
+            print("✅ Using Simple tracker")
+            return SimpleTracker(
+                max_age=config.TRACKER_MAX_AGE,
+                iou_threshold=0.35
+            )
+        except ImportError as e:
+            print(f"⚠️  Simple tracker not available: {e}")
+            print("   Falling back to SORT...")
+
+    if tracker_name.startswith('sort'):
         try:
             from sort_tracker import SORTTracker
             print("✅ Using SORT tracker")
@@ -180,10 +354,31 @@ def initialize_tracker(tracker_type='SORT (Fast) ⭐'):
             # Fallback to DeepSort
     
     # Default: DeepSort
-    print("✅ Using DeepSort tracker")
-    # Kiểm tra GPU từ config
+    # Check GPU from config
     use_gpu = config.USE_GPU and torch.cuda.is_available()
-    
+
+    # DeepSort on CPU is usually too slow for real-time. Auto fallback to fast tracker.
+    if not use_gpu:
+        try:
+            from sort_tracker import SORTTracker
+            print("DeepSort on CPU -> fallback to SORT for FPS")
+            return SORTTracker(
+                max_age=config.TRACKER_MAX_AGE,
+                min_hits=config.TRACKER_N_INIT,
+                iou_threshold=0.2
+            )
+        except ImportError:
+            try:
+                from simple_tracker import SimpleTracker
+                print("DeepSort on CPU -> fallback to Simple tracker for FPS")
+                return SimpleTracker(
+                    max_age=config.TRACKER_MAX_AGE,
+                    iou_threshold=0.35
+                )
+            except ImportError:
+                print("Fast fallback tracker unavailable, using DeepSort CPU (slow)")
+
+    print("Using DeepSort tracker")
     tracker = DeepSort(
         max_age=config.TRACKER_MAX_AGE,
         n_init=config.TRACKER_N_INIT,
@@ -191,7 +386,7 @@ def initialize_tracker(tracker_type='SORT (Fast) ⭐'):
         embedder='mobilenet',
         embedder_gpu=use_gpu
     )
-    
+
     return tracker
 
 

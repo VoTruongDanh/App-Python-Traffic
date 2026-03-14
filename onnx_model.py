@@ -4,6 +4,8 @@ ONNX Runtime wrapper for YOLO models - 2-3x faster than PyTorch
 import numpy as np
 import cv2
 from typing import List, Tuple
+import ast
+import json
 
 # Try to import onnxruntime safely (may fail with NumPy 2.x)
 try:
@@ -16,6 +18,12 @@ except (ImportError, AttributeError) as e:
     ort = None
 
 import torch
+
+if ONNX_AVAILABLE and hasattr(ort, "preload_dlls"):
+    try:
+        ort.preload_dlls()
+    except Exception as exc:
+        print(f"[WARN] ONNX Runtime DLL preload skipped: {exc}")
 
 
 class ONNXModel:
@@ -47,9 +55,11 @@ class ONNXModel:
         # Create session with optimizations
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_options.intra_op_num_threads = 2  # Giảm từ 4 → 2
-        sess_options.inter_op_num_threads = 1  # Giảm từ 2 → 1
-        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        # Let ONNX Runtime choose optimal thread pools for current hardware.
+        # Forcing very low thread counts (e.g. 2/1) can severely bottleneck CPU inference.
+        sess_options.intra_op_num_threads = 0
+        sess_options.inter_op_num_threads = 0
+        sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
         sess_options.enable_cpu_mem_arena = True  # Enable memory arena
         sess_options.enable_mem_pattern = True  # Enable memory pattern optimization
         
@@ -84,8 +94,16 @@ class ONNXModel:
         try:
             metadata = self.session.get_modelmeta().custom_metadata_map
             if 'names' in metadata:
-                import json
-                return json.loads(metadata['names'])
+                names_raw = metadata['names']
+                try:
+                    names = json.loads(names_raw)
+                except Exception:
+                    names = ast.literal_eval(names_raw)
+
+                if isinstance(names, dict):
+                    return {int(k): str(v) for k, v in names.items()}
+                if isinstance(names, list):
+                    return {idx: str(name) for idx, name in enumerate(names)}
         except:
             pass
         
@@ -280,7 +298,8 @@ class ONNXModel:
         return keep
     
     def __call__(self, image: np.ndarray, conf: float = 0.25, iou: float = 0.45,
-                verbose: bool = False, classes: List[int] = None, max_det: int = 300):
+                verbose: bool = False, classes: List[int] = None, max_det: int = 300,
+                half: bool = False, **kwargs):
         """
         Run inference (mimics YOLO interface)
         
@@ -291,10 +310,14 @@ class ONNXModel:
             verbose: Print verbose output
             classes: Filter by class IDs
             max_det: Maximum detections
+            half: Ignored for ONNX compatibility with YOLO call sites
+            **kwargs: Extra YOLO-style inference kwargs accepted for compatibility
             
         Returns:
             List with single ONNXResults object (mimics YOLO)
         """
+        del verbose, half, kwargs
+
         # Store original image size for scaling
         orig_h, orig_w = image.shape[:2]
         
@@ -362,34 +385,33 @@ class ONNXBoxes:
     def xyxy(self):
         """Get boxes in xyxy format (mimics YOLO)"""
         if self._xyxy is None:
-            boxes = []
-            for det in self.detections:
-                # Convert to tensor-like object
-                box = torch.tensor(det['xyxy'], dtype=torch.float32)
-                boxes.append(box)
-            self._xyxy = boxes
+            if not self.detections:
+                self._xyxy = torch.empty((0, 4), dtype=torch.float32)
+            else:
+                boxes = np.array([det['xyxy'] for det in self.detections], dtype=np.float32)
+                self._xyxy = torch.from_numpy(boxes)
         return self._xyxy
     
     @property
     def conf(self):
         """Get confidence scores (mimics YOLO)"""
         if self._conf is None:
-            confs = []
-            for det in self.detections:
-                conf = torch.tensor([det['conf']], dtype=torch.float32)
-                confs.append(conf)
-            self._conf = confs
+            if not self.detections:
+                self._conf = torch.empty((0,), dtype=torch.float32)
+            else:
+                confs = np.array([det['conf'] for det in self.detections], dtype=np.float32)
+                self._conf = torch.from_numpy(confs)
         return self._conf
     
     @property
     def cls(self):
         """Get class IDs (mimics YOLO)"""
         if self._cls is None:
-            classes = []
-            for det in self.detections:
-                cls = torch.tensor([det['cls']], dtype=torch.int64)
-                classes.append(cls)
-            self._cls = classes
+            if not self.detections:
+                self._cls = torch.empty((0,), dtype=torch.int64)
+            else:
+                classes = np.array([det['cls'] for det in self.detections], dtype=np.int64)
+                self._cls = torch.from_numpy(classes)
         return self._cls
     
     def __iter__(self):

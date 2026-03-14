@@ -7,6 +7,9 @@ numpy>=1.24.0
 ultralytics>=8.0.0
 torch>=2.0.0
 torchvision>=0.15.0
+# For NVIDIA GPU acceleration on Windows, run:
+#   setup_gpu_windows.bat
+# This installs CUDA-enabled torch wheels + onnxruntime-gpu.
 
 # Tracking
 deep-sort-realtime>=1.3.2

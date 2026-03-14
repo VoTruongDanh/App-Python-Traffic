@@ -86,6 +86,36 @@ FONT_SCALE = 0.3  # Giảm thêm: 0.4 → 0.3
 FONT_THICKNESS = 1
 TEXT_COLOR = (255, 255, 255)
 
+# Distinct class colors in BGR for easier visual separation
+CLASS_COLORS = {
+    0: (0, 255, 80),      # pedestrian/person - green
+    1: (255, 215, 0),     # bicycle - gold
+    2: (255, 140, 0),     # car/motorbike (custom cls 2) - orange
+    3: (255, 0, 180),     # bus - magenta
+    4: (0, 200, 255),     # truck - sky
+    5: (80, 80, 255),     # container truck / bus - red-blue
+    6: (0, 128, 255),     # car custom cls 6 - amber
+    7: (180, 105, 255),   # truck coco cls 7 - purple
+}
+
+
+def get_class_color(cls_id: int):
+    """Return a stable BGR color for each class."""
+    if cls_id in CLASS_COLORS:
+        return CLASS_COLORS[cls_id]
+
+    fallback_palette = [
+        (0, 255, 80),
+        (255, 215, 0),
+        (255, 140, 0),
+        (255, 0, 180),
+        (0, 200, 255),
+        (80, 80, 255),
+        (180, 105, 255),
+        (120, 220, 120),
+    ]
+    return fallback_palette[cls_id % len(fallback_palette)]
+
 # Statistics panel
 STATS_BG_COLOR = (0, 0, 0)
 STATS_WIDTH = 250

@@ -15,6 +15,7 @@ from typing import Tuple, Dict, Optional
 from collections import deque
 import threading
 import time
+from contextlib import nullcontext
 import config
 
 # Try to import torch for CUDA support
@@ -76,6 +77,11 @@ class UltraVideoProcessor:
         self.cleanup_interval = 50
         
         print("🚀 UltraVideoProcessor initialized with async double-buffer pipeline")
+
+    def _inference_context(self):
+        if TORCH_AVAILABLE:
+            return torch.inference_mode()
+        return nullcontext()
     
     def _detect_train2(self) -> bool:
         """Detect if using Train2 multi-class model"""
@@ -88,6 +94,22 @@ class UltraVideoProcessor:
             except:
                 pass
         return False
+
+    def _get_shared_model_names(self) -> dict:
+        """Return native class names when one detector is shared."""
+        if self.model_person is not self.model_vehicle:
+            return {}
+
+        try:
+            names = getattr(self.model_person, 'names', {})
+            if isinstance(names, dict):
+                return {int(k): str(v) for k, v in names.items()}
+            if isinstance(names, list):
+                return {idx: str(name) for idx, name in enumerate(names)}
+        except Exception:
+            pass
+
+        return {}
     
     def start_async_inference(self):
         """Start background inference thread"""
@@ -155,27 +177,28 @@ class UltraVideoProcessor:
         
         detections = []
         
-        if self.using_train2 or (self.model_person is self.model_vehicle):
-            results = self.model_person(inference_frame, **inference_kwargs)[0]
-            detections = self._batch_extract(results, scale_factor)
-        else:
-            # Dual model (person + vehicle)
-            person_kwargs = inference_kwargs.copy()
-            person_kwargs['classes'] = [config.PERSON_CLASS]
-            person_kwargs['max_det'] = max(5, max_det // 2)
-            
-            results_person = self.model_person(inference_frame, **person_kwargs)[0]
-            person_dets = self._batch_extract(results_person, scale_factor)
-            for det in person_dets:
-                det[2] = config.PERSON_CLASS
-            detections.extend(person_dets)
-            
-            vehicle_kwargs = inference_kwargs.copy()
-            vehicle_kwargs['classes'] = config.VEHICLE_CLASSES
-            vehicle_kwargs['max_det'] = max(5, max_det // 2)
-            
-            results_vehicle = self.model_vehicle(inference_frame, **vehicle_kwargs)[0]
-            detections.extend(self._batch_extract(results_vehicle, scale_factor))
+        with self._inference_context():
+            if self.using_train2 or (self.model_person is self.model_vehicle):
+                results = self.model_person(inference_frame, **inference_kwargs)[0]
+                detections = self._batch_extract(results, scale_factor)
+            else:
+                # Dual model (person + vehicle)
+                person_kwargs = inference_kwargs.copy()
+                person_kwargs['classes'] = [config.PERSON_CLASS]
+                person_kwargs['max_det'] = max(5, max_det // 2)
+                
+                results_person = self.model_person(inference_frame, **person_kwargs)[0]
+                person_dets = self._batch_extract(results_person, scale_factor)
+                for det in person_dets:
+                    det[2] = config.PERSON_CLASS
+                detections.extend(person_dets)
+                
+                vehicle_kwargs = inference_kwargs.copy()
+                vehicle_kwargs['classes'] = config.VEHICLE_CLASSES
+                vehicle_kwargs['max_det'] = max(5, max_det // 2)
+                
+                results_vehicle = self.model_vehicle(inference_frame, **vehicle_kwargs)[0]
+                detections.extend(self._batch_extract(results_vehicle, scale_factor))
         
         return detections
     
@@ -203,6 +226,18 @@ class UltraVideoProcessor:
             detections.append([[x1, y1, w, h], float(confs[i]), int(cls_ids[i])])
         
         return detections
+
+    def _filter_roi_detections(self, detections: list) -> list:
+        """Apply ROI filtering before tracking."""
+        if not self.roi_manager or not self.roi_manager.is_active():
+            return detections
+
+        filtered = []
+        for bbox, conf, cls_id in detections:
+            x1, y1, w, h = bbox
+            if self.roi_manager.is_object_in_roi([x1, y1, x1 + w, y1 + h]):
+                filtered.append([bbox, conf, cls_id])
+        return filtered
     
     def process_frame(self, frame: np.ndarray, resize_scale: int = 100, max_det: int = 20) -> Tuple[np.ndarray, Dict]:
         """
@@ -212,6 +247,7 @@ class UltraVideoProcessor:
         """
         # Run inference SYNCHRONOUSLY to avoid flickering
         detections = self._run_inference(frame, resize_scale, max_det)
+        detections = self._filter_roi_detections(detections)
         
         # Tracking with CURRENT frame detections
         tracks = self.tracker.update_tracks(detections, frame=frame) if detections else []
@@ -229,7 +265,7 @@ class UltraVideoProcessor:
             class_name = self._get_class_name(cls_id)
             class_counts[class_name] = class_counts.get(class_name, 0) + 1
             
-            color = self.color_person if cls_id == config.PERSON_CLASS else self.color_vehicle
+            color = config.get_class_color(cls_id)
             
             cv2.rectangle(frame, (int(ltrb[0]), int(ltrb[1])), (int(ltrb[2]), int(ltrb[3])), color, self.box_thickness)
             # Full label with class name + ID
@@ -256,6 +292,9 @@ class UltraVideoProcessor:
     
     def _get_class_name(self, cls_id: int) -> str:
         """Get class name from ID"""
+        shared_names = self._get_shared_model_names()
+        if shared_names:
+            return shared_names.get(cls_id, f"Class {cls_id}")
         if self.using_train2:
             return config.TRAIN2_CLASSES.get(cls_id, 'Unknown')
         return config.CLASS_NAMES.get(cls_id, 'Unknown')

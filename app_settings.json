@@ -1,13 +1,14 @@
 {
-  "model_choice": "YOLOv26n (Fastest)",
-  "best_model_choice": "Custom (Browse file)...",
-  "tracker_choice": "SORT (Fast) \u2b50",
-  "confidence": 85,
+  "model_choice": "Custom model...",
+  "custom_model_path": "D:/BaiTapSinhVien/DoAnKySu/UI/trainv4/yolo3v4.onnx",
+  "tracker_choice": "DeepSORT (Stable)",
+  "confidence": 25,
   "frame_skip": 0,
   "resize_scale": "100% (Full Quality)",
-  "smooth_mode": false,
+  "smooth_mode": true,
+  "processing_mode": "ultra",
   "stream_quality": "1080p (Best Quality)",
   "video_type": "\ud83d\udd34 Livestream",
-  "roi_threshold": 38,
+  "roi_threshold": 69,
   "roi_visible": true
 }

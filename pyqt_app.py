@@ -5,13 +5,17 @@ High-performance alternative to Streamlit for local use
 import config
 from model_loader import load_yolo_models, initialize_tracker
 
+import os
+import shutil
+import subprocess
 import sys
 import cv2
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QSlider, QComboBox,
                              QFileDialog, QLineEdit, QGroupBox, QGridLayout, QTextEdit,
-                             QDialog, QProgressBar, QListWidget, QListWidgetItem)
+                             QDialog, QProgressBar, QListWidget, QListWidgetItem, QToolButton,
+                             QScrollArea, QFrame)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QFont
 import time
@@ -23,9 +27,9 @@ from roi_manager import ROIManager
 
 # Global state for model selection (replacement for st.session_state)
 class AppState:
-    model_choice = "YOLOv8n"
-    tracker_choice = "Simple (Fastest)"
-    best_model_choice = "Train1 (Person only) - ../best.pt"  # NEW: best.pt selection
+    model_choice = "YOLOv26n (Fastest)"
+    tracker_choice = "SORT (Fast)"
+    best_model_choice = "None (Use base YOLO only)"
 
 app_state = AppState()
 
@@ -47,6 +51,7 @@ class VideoThread(QThread):
         
         self.frame_buffer = []  # DISABLED: Buffer causes 2-3 frame delay
         self.max_buffer_size = 1  # Keep only 1 frame (effectively disabled)
+        self._last_stats = {'total_objects': 0, 'class_counts': {}}
         
     def set_source(self, source):
         self.source = source
@@ -167,6 +172,16 @@ class VideoThread(QThread):
                 consecutive_failures = 0
                 last_success_time = time.time()
                 frame_count += 1
+
+                # Apply frame-skip before expensive processing
+                if self.frame_skip > 0:
+                    skip_counter = (skip_counter + 1) % (self.frame_skip + 1)
+                    if skip_counter != 0:
+                        if self.smooth_mode and last_processed_frame is not None:
+                            self.frame_ready.emit(last_processed_frame, self._last_stats)
+                        else:
+                            self.frame_ready.emit(frame, self._last_stats)
+                        continue
                 
                 # OPTIMIZED: Process current frame directly (no buffer delay)
                 # Old buffer logic caused 2-3 frame delay
@@ -180,6 +195,7 @@ class VideoThread(QThread):
                         processed_frame, stats = self.processor.process_frame(process_frame, self.resize_scale, self.max_det)
                     
                     last_processed_frame = processed_frame
+                    self._last_stats = stats
                     self.frame_ready.emit(processed_frame, stats)
                     
                     # FRAME PACING: Only for livestream to prevent fast-forward
@@ -219,6 +235,24 @@ class MainWindow(QMainWindow):
         self.fps_counter = 0
         self.fps_start_time = time.time()
         self.current_fps = 0
+        self.last_display_time = 0.0
+        self.display_target_fps = 24
+        self.display_frame_interval = 1.0 / self.display_target_fps
+        self.last_auto_cleanup_time = 0.0
+        self.auto_cleanup_cooldown = 20.0
+        self.last_runtime_refresh_time = 0.0
+        self.runtime_refresh_interval = 2.0
+        self.last_stats_text = ""
+        self.last_fps_color = ""
+        self.video_source = None
+
+        # Debounced restart state for heavy changes while stream is running.
+        self.pending_restart = False
+        self.pending_reload_models = False
+        self.restart_message = ""
+        self.restart_timer = QTimer(self)
+        self.restart_timer.setSingleShot(True)
+        self.restart_timer.timeout.connect(self._apply_pending_restart)
         
         # Detection settings
         self.max_det = 20  # Default max detections
@@ -252,41 +286,60 @@ class MainWindow(QMainWindow):
     def setup_ui(self):
         """Setup user interface"""
         central_widget = QWidget()
+        central_widget.setObjectName("rootSurface")
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(16, 14, 16, 14)
+        main_layout.setSpacing(14)
         
         # Left panel - Video display
         left_panel = QVBoxLayout()
+        left_panel.setSpacing(10)
+
+        title_row = QHBoxLayout()
+        self.video_title_label = QLabel("Live View")
+        self.video_title_label.setObjectName("videoTitle")
+        title_row.addWidget(self.video_title_label)
+        title_row.addStretch()
+
+        self.btn_toggle_sidebar = QPushButton("Hide Controls")
+        self.btn_toggle_sidebar.setObjectName("secondaryAction")
+        self.btn_toggle_sidebar.clicked.connect(self.toggle_sidebar)
+        title_row.addWidget(self.btn_toggle_sidebar)
+        left_panel.addLayout(title_row)
         
         # Video display label
         self.video_label = QLabel()
+        self.video_label.setObjectName("videoSurface")
         self.video_label.setMinimumSize(960, 540)
-        self.video_label.setStyleSheet("background-color: black; border: 2px solid #444;")
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setText("No video loaded")
+        self.video_label.setText("Load video or livestream to begin")
         self.video_label.setMouseTracking(True)
         self.video_label.mousePressEvent = self.on_video_label_click
         left_panel.addWidget(self.video_label)
         
         # FPS display
         self.fps_label = QLabel("FPS: 0.0")
-        self.fps_label.setFont(QFont("Arial", 14, QFont.Bold))
-        self.fps_label.setStyleSheet("color: #4ade80; padding: 5px;")
+        self.fps_label.setObjectName("fpsBadge")
+        self.fps_label.setFont(QFont("Segoe UI", 12, QFont.Bold))
         left_panel.addWidget(self.fps_label)
         
         # Control buttons
         button_layout = QHBoxLayout()
         
         self.btn_load_video = QPushButton("📁 Load Video")
+        self.btn_load_video.setObjectName("secondaryAction")
         self.btn_load_video.clicked.connect(self.load_video_file)
         button_layout.addWidget(self.btn_load_video)
         
         self.btn_start = QPushButton("▶️ Start")
+        self.btn_start.setObjectName("primaryAction")
         self.btn_start.clicked.connect(self.start_processing)
         self.btn_start.setEnabled(False)
         button_layout.addWidget(self.btn_start)
         
         self.btn_stop = QPushButton("⏹️ Stop")
+        self.btn_stop.setObjectName("dangerAction")
         self.btn_stop.clicked.connect(self.stop_processing)
         self.btn_stop.setEnabled(False)
         button_layout.addWidget(self.btn_stop)
@@ -296,37 +349,80 @@ class MainWindow(QMainWindow):
         # Right panel - Controls and stats
         right_panel = QVBoxLayout()
         right_panel.setSpacing(10)
+
+        runtime_shell = QFrame()
+        runtime_shell.setObjectName("panelShell")
+        runtime_shell_layout = QVBoxLayout(runtime_shell)
+        runtime_shell_layout.setContentsMargins(0, 0, 0, 0)
+        runtime_shell_layout.setSpacing(8)
+
+        runtime_header = QHBoxLayout()
+        self.runtime_toggle_button = QToolButton()
+        self.runtime_toggle_button.setText("Runtime Overview")
+        self.runtime_toggle_button.setCheckable(True)
+        self.runtime_toggle_button.setChecked(True)
+        self.runtime_toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.runtime_toggle_button.setArrowType(Qt.DownArrow)
+        self.runtime_toggle_button.clicked.connect(self.toggle_runtime_section)
+        runtime_header.addWidget(self.runtime_toggle_button)
+        runtime_header.addStretch()
+        runtime_shell_layout.addLayout(runtime_header)
+
+        self.runtime_panel = QFrame()
+        self.runtime_panel.setObjectName("runtimeCard")
+        runtime_layout = QVBoxLayout(self.runtime_panel)
+        runtime_badge_grid = QGridLayout()
+        runtime_badge_grid.setHorizontalSpacing(8)
+        runtime_badge_grid.setVerticalSpacing(8)
+
+        self.backend_badge = QLabel("Backend: Detecting")
+        self.backend_badge.setObjectName("metricChip")
+        runtime_badge_grid.addWidget(self.backend_badge, 0, 0)
+
+        self.mode_badge = QLabel("Mode: Standard")
+        self.mode_badge.setObjectName("metricChip")
+        runtime_badge_grid.addWidget(self.mode_badge, 0, 1)
+
+        self.tracker_badge = QLabel("Tracker: Simple")
+        self.tracker_badge.setObjectName("metricChip")
+        runtime_badge_grid.addWidget(self.tracker_badge, 1, 0)
+
+        self.source_badge = QLabel("Source: Waiting")
+        self.source_badge.setObjectName("metricChip")
+        runtime_badge_grid.addWidget(self.source_badge, 1, 1)
+        runtime_layout.addLayout(runtime_badge_grid)
+
+        self.runtime_hint_label = QLabel("Balanced preset and 75% resize are the best starting point for stable live FPS.")
+        self.runtime_hint_label.setObjectName("subtleInfo")
+        self.runtime_hint_label.setWordWrap(True)
+        runtime_layout.addWidget(self.runtime_hint_label)
+
+        self.runtime_summary_label = QLabel("Waiting for models...")
+        self.runtime_summary_label.setObjectName("summaryCard")
+        self.runtime_summary_label.setWordWrap(True)
+        runtime_layout.addWidget(self.runtime_summary_label)
+
+        runtime_shell_layout.addWidget(self.runtime_panel)
+        right_panel.addWidget(runtime_shell)
         
         # Model selection
         model_group = QGroupBox("Model Settings")
         model_layout = QVBoxLayout()
         
-        # Best.pt selection
-        model_layout.addWidget(QLabel("Trained Model (best.pt):"))
-        self.best_model_combo = QComboBox()
-        self.best_model_combo.addItems([
-            "None (Use base YOLO only)",
-            "Train1 (Person only) - ../best.pt",
-            "Train2 (Multi-class) - ../Train2/best.pt",
-            "Custom (Browse file)..."
-        ])
-        self.best_model_combo.setCurrentIndex(1)  # Default: Train1
-        self.best_model_combo.setToolTip(
-            "None: Use base YOLO model only (no custom training)\n"
-            "Train1: best.pt trained for person detection only\n"
-            "Train2: best.pt trained for person + vehicles (car, bus, truck, motorcycle)\n"
-            "Custom: Browse and select your own best.pt file"
-        )
-        self.best_model_combo.currentTextChanged.connect(self.on_best_model_changed)
-        model_layout.addWidget(self.best_model_combo)
-        
-        # Custom model path (hidden by default)
         self.custom_model_path = None
         
-        model_layout.addWidget(QLabel("Base YOLO Model:"))
+        model_layout.addWidget(QLabel("Detection Model:"))
         self.model_combo = QComboBox()
-        self.model_combo.addItems(["YOLOv26n (Fastest)", "YOLOv8n", "YOLOv11n", "YOLOv11s (Fast)", "YOLOv3"])
-        self.model_combo.setCurrentIndex(0)  # Default: YOLOv26n
+        self.model_combo.addItems([
+            "YOLOv26n (GPU Recommended)",
+            "YOLOv8n",
+            "YOLOv11n",
+            "YOLOv11s (Fast)",
+            "Train1 (Person model)",
+            "Train2 (Multi-class)",
+            "Custom model..."
+        ])
+        self.model_combo.setCurrentIndex(0)
         self.model_combo.setToolTip(
             "YOLOv26n: NEW! Fastest & Edge-optimized (Recommended) 🚀\n"
             "YOLOv8n: Fast & Accurate\n"
@@ -337,15 +433,35 @@ class MainWindow(QMainWindow):
             "or for all detection when 'None' is selected"
         )
         self.model_combo.currentTextChanged.connect(self.on_model_changed)
+        self.model_combo.setToolTip(
+            "YOLOv26n: fastest GPU-friendly base model\n"
+            "YOLOv8n / YOLOv11*: pretrained base models\n"
+            "Train1: custom person model + YOLOv26n for vehicles\n"
+            "Train2: one custom multi-class model\n"
+            "Custom: use Browse to choose your own .pt or .onnx model"
+        )
         model_layout.addWidget(self.model_combo)
+        self.last_model_selection = self.model_combo.currentText()
+
+        custom_row = QHBoxLayout()
+        self.custom_model_input = QLineEdit()
+        self.custom_model_input.setReadOnly(True)
+        self.custom_model_input.setPlaceholderText("No custom model selected")
+        custom_row.addWidget(self.custom_model_input)
+
+        self.btn_browse_custom_model = QPushButton("Browse...")
+        self.btn_browse_custom_model.setObjectName("secondaryAction")
+        self.btn_browse_custom_model.clicked.connect(self.browse_custom_model)
+        custom_row.addWidget(self.btn_browse_custom_model)
+        model_layout.addLayout(custom_row)
         
-        model_layout.addWidget(QLabel("Tracker:"))
+        model_layout.addWidget(QLabel("Tracking Mode:"))
         self.tracker_combo = QComboBox()
-        self.tracker_combo.addItems(["SORT (Fast) ⭐", "DeepSort (Stable)"])
-        self.tracker_combo.setCurrentIndex(0)  # Default: SORT
+        self.tracker_combo.addItems(["SORT (Fast)", "DeepSORT (Stable)"])
+        self.tracker_combo.setCurrentIndex(0)
         self.tracker_combo.setToolTip(
-            "SORT: Fast, Kalman Filter + Hungarian (Recommended)\n"
-            "DeepSort: Stable, appearance embedding (slower)"
+            "SORT: faster tracking and lighter CPU/GPU load\n"
+            "DeepSORT: more stable IDs, slower than SORT"
         )
         self.tracker_combo.currentTextChanged.connect(self.on_tracker_changed)
         model_layout.addWidget(self.tracker_combo)
@@ -363,7 +479,6 @@ class MainWindow(QMainWindow):
         self.confidence_slider.setMaximum(100)
         self.confidence_slider.setValue(50)
         self.confidence_slider.valueChanged.connect(self.on_confidence_changed)
-        self.confidence_slider.sliderReleased.connect(self.auto_reload_if_running)
         detection_layout.addWidget(self.confidence_slider)
         
         self.confidence_label = QLabel("0.50")
@@ -410,7 +525,7 @@ class MainWindow(QMainWindow):
         self.btn_display_mode = QPushButton("🎯 Display: Point Label")
         self.btn_display_mode.setCheckable(True)
         self.btn_display_mode.setChecked(True)  # Default: Point mode
-        self.btn_display_mode.setStyleSheet("background-color: #3b82f6; color: white;")
+        self.btn_display_mode.setStyleSheet("background-color: #0f766e; color: white;")
         self.btn_display_mode.setToolTip(
             "Point Label: Show center point + label (Faster, cleaner)\n"
             "Bounding Box: Show full box around object (Traditional)"
@@ -422,7 +537,7 @@ class MainWindow(QMainWindow):
         self.btn_trail_toggle = QPushButton("🔴 Trail: OFF")
         self.btn_trail_toggle.setCheckable(True)
         self.btn_trail_toggle.setChecked(False)  # Default: OFF
-        self.btn_trail_toggle.setStyleSheet("background-color: #ef4444; color: white;")
+        self.btn_trail_toggle.setStyleSheet("background-color: #b42318; color: white;")
         self.btn_trail_toggle.setToolTip("Toggle object movement trail (OFF = faster)")
         self.btn_trail_toggle.clicked.connect(self.toggle_trail)
         detection_layout.addWidget(self.btn_trail_toggle)
@@ -455,8 +570,6 @@ class MainWindow(QMainWindow):
         
         self.tracker_age_label = QLabel("15 frames")
         detection_layout.addWidget(self.tracker_age_label)
-        self.btn_trail_toggle.clicked.connect(self.toggle_trail)
-        detection_layout.addWidget(self.btn_trail_toggle)
         
         detection_group.setLayout(detection_layout)
         right_panel.addWidget(detection_group)
@@ -470,7 +583,7 @@ class MainWindow(QMainWindow):
         self.frame_skip_slider.setMinimum(0)
         self.frame_skip_slider.setMaximum(10)
         self.frame_skip_slider.setValue(0)  # Default: 0 (no skip)
-        self.frame_skip_slider.sliderReleased.connect(self.auto_reload_if_running)  # Auto-reload
+        self.frame_skip_slider.valueChanged.connect(self.on_frame_skip_changed)
         perf_layout.addWidget(self.frame_skip_slider)
         
         self.frame_skip_label = QLabel("Skip: 0 frames")
@@ -487,7 +600,7 @@ class MainWindow(QMainWindow):
             "50% (Fast)",
             "25% (Ultra Fast)"
         ])
-        self.resize_combo.setCurrentIndex(0)  # Default: 100%
+        self.resize_combo.setCurrentIndex(1)  # Default: 75% balanced
         self.resize_combo.setToolTip(
             "Resize inference resolution for speed:\n"
             "100%: Full 1920x1080 (Best quality, slower)\n"
@@ -495,50 +608,33 @@ class MainWindow(QMainWindow):
             "50%: 960x540 (2-3x faster)\n"
             "25%: 480x270 (4-5x faster, lower quality)"
         )
+        self.resize_combo.currentTextChanged.connect(self.on_resize_changed)
         self.resize_combo.setEnabled(True)  # ENABLED
         perf_layout.addWidget(self.resize_combo)
         
-        # Threaded mode toggle
-        self.btn_threaded_mode = QPushButton("🚀 Multi-Threading: OFF")
-        self.btn_threaded_mode.setCheckable(True)
-        self.btn_threaded_mode.setChecked(False)  # Default: OFF
-        self.btn_threaded_mode.setStyleSheet("background-color: #ef4444; color: white;")
-        self.btn_threaded_mode.setToolTip(
-            "Enable parallel inference and drawing\n"
-            "ON: 2x faster, use more CPU/GPU\n"
-            "OFF: Standard processing"
+        perf_layout.addWidget(QLabel("Pipeline Mode:"))
+        self.processing_mode_combo = QComboBox()
+        self.processing_mode_combo.addItem("Standard - full analytics", "standard")
+        self.processing_mode_combo.addItem("Threaded - safer parallelism", "threaded")
+        self.processing_mode_combo.addItem("Optimized - lighter overlays", "optimized")
+        self.processing_mode_combo.addItem("Ultra - max FPS live mode", "ultra")
+        self.processing_mode_combo.setToolTip(
+            "Standard: richest labels and analytics\n"
+            "Threaded: better overlap of work\n"
+            "Optimized: lighter rendering for smoother playback\n"
+            "Ultra: highest FPS / lowest latency"
         )
-        self.btn_threaded_mode.clicked.connect(self.toggle_threaded_mode)
-        perf_layout.addWidget(self.btn_threaded_mode)
-        
-        # Optimized mode toggle
-        self.btn_optimized_mode = QPushButton("⚡ Optimized Mode: OFF")
-        self.btn_optimized_mode.setCheckable(True)
-        self.btn_optimized_mode.setChecked(False)  # Default: OFF
-        self.btn_optimized_mode.setStyleSheet("background-color: #ef4444; color: white;")
-        self.btn_optimized_mode.setToolTip(
-            "Enable experimental optimized processor\n"
-            "ON: 30+ FPS, minimal drawing, no trails\n"
-            "OFF: Standard drawing with trails"
-        )
-        self.btn_optimized_mode.clicked.connect(self.toggle_optimized_mode)
-        perf_layout.addWidget(self.btn_optimized_mode)
-        
-        # Ultra mode toggle (NEW - highest FPS)
-        self.btn_ultra_mode = QPushButton("🔥 Ultra Mode: OFF")
-        self.btn_ultra_mode.setCheckable(True)
-        self.btn_ultra_mode.setChecked(False)
-        self.btn_ultra_mode.setStyleSheet("background-color: #ef4444; color: white;")
-        self.btn_ultra_mode.setToolTip(
-            "Enable Ultra processor with async double-buffer pipeline\n"
-            "ON: 50+ FPS, async inference, lowest latency\n"
-            "OFF: Standard or Optimized mode"
-        )
-        self.btn_ultra_mode.clicked.connect(self.toggle_ultra_mode)
-        perf_layout.addWidget(self.btn_ultra_mode)
+        self.processing_mode_combo.currentIndexChanged.connect(self.on_processing_mode_changed)
+        perf_layout.addWidget(self.processing_mode_combo)
+
+        self.processing_mode_hint = QLabel("Ultra is recommended for livestreams. Standard is best when you need richer labels.")
+        self.processing_mode_hint.setObjectName("subtleInfo")
+        self.processing_mode_hint.setWordWrap(True)
+        perf_layout.addWidget(self.processing_mode_hint)
         
         # Manual cleanup button
         btn_cleanup = QPushButton("🧹 Clear Cache Now")
+        btn_cleanup.setObjectName("warnButton")
         btn_cleanup.setStyleSheet("background-color: #f59e0b; color: white;")
         btn_cleanup.setToolTip("Manually clear memory cache\nUse if app becomes slow")
         btn_cleanup.clicked.connect(self.manual_cleanup)
@@ -554,31 +650,32 @@ class MainWindow(QMainWindow):
         preset_layout.addWidget(btn_quality)
         
         btn_balanced = QPushButton("Balanced")
-        btn_balanced.setToolTip("Skip:2 (~25-30 FPS)\nGood balance")
-        btn_balanced.clicked.connect(lambda: self.apply_preset(2, 100))
+        btn_balanced.setToolTip("Skip:1 + Resize:75%\nBest balance for most cameras")
+        btn_balanced.clicked.connect(lambda: self.apply_preset(1, 75))
         preset_layout.addWidget(btn_balanced)
         
         btn_speed = QPushButton("Speed")
-        btn_speed.setToolTip("Skip:3 (~35-40 FPS)\nFast, smooth")
-        btn_speed.clicked.connect(lambda: self.apply_preset(3, 100))
+        btn_speed.setToolTip("Skip:2 + Resize:50%\nHigh FPS with acceptable detail")
+        btn_speed.clicked.connect(lambda: self.apply_preset(2, 50))
         btn_speed.setStyleSheet("background-color: #22c55e; color: white; font-weight: bold;")
         preset_layout.addWidget(btn_speed)
         
         perf_layout.addLayout(preset_layout)
         
         # Add smooth mode toggle
-        self.smooth_mode = False  # Default: OFF (tránh ghost frames)
-        btn_smooth_toggle = QPushButton("🎬 Smooth Mode: OFF")
-        btn_smooth_toggle.setCheckable(True)
-        btn_smooth_toggle.setChecked(False)  # OFF by default
-        btn_smooth_toggle.setChecked(True)  # Default: checked
-        btn_smooth_toggle.setStyleSheet("background-color: #4ade80; color: white;")
-        btn_smooth_toggle.setToolTip(
+        self.smooth_mode = True  # Default: ON for smoother output
+        self.btn_smooth_toggle = QPushButton("Smooth Mode: ON")
+        self.btn_smooth_toggle.setCheckable(True)
+        self.btn_smooth_toggle.setChecked(True)
+        self.btn_smooth_toggle.setStyleSheet("background-color: #15803d; color: white;")
+        self.btn_smooth_toggle.setToolTip(
             "ON: Display last frame when skipping (smoother but less accurate)\n"
             "OFF: Only show processed frames (accurate but may stutter)"
         )
-        btn_smooth_toggle.clicked.connect(lambda checked: self.toggle_smooth_mode(checked, btn_smooth_toggle))
-        perf_layout.addWidget(btn_smooth_toggle)
+        self.btn_smooth_toggle.clicked.connect(
+            lambda checked: self.toggle_smooth_mode(checked, self.btn_smooth_toggle)
+        )
+        perf_layout.addWidget(self.btn_smooth_toggle)
         
         perf_group.setLayout(perf_layout)
         right_panel.addWidget(perf_group)
@@ -632,6 +729,7 @@ class MainWindow(QMainWindow):
         stream_layout.addWidget(self.video_type_combo)
         
         self.btn_start_stream = QPushButton("📡 Start Livestream")
+        self.btn_start_stream.setObjectName("accentAction")
         self.btn_start_stream.clicked.connect(self.start_livestream)
         stream_layout.addWidget(self.btn_start_stream)
         
@@ -690,7 +788,7 @@ class MainWindow(QMainWindow):
         
         # ROI status
         self.roi_status_label = QLabel("ROI: Inactive")
-        self.roi_status_label.setStyleSheet("color: #666; padding: 5px;")
+        self.roi_status_label.setObjectName("subtleInfo")
         roi_layout.addWidget(self.roi_status_label)
         
         roi_group.setLayout(roi_layout)
@@ -702,17 +800,21 @@ class MainWindow(QMainWindow):
         
         # Current model info
         self.model_info_label = QLabel("Model: Loading...")
-        self.model_info_label.setStyleSheet(
-            "background-color: #2d2d2d; color: #fbbf24; padding: 8px; "
-            "border-radius: 4px; font-weight: bold; font-size: 11px;"
-        )
+        self.model_info_label.setObjectName("modelChip")
         self.model_info_label.setWordWrap(True)
         stats_layout.addWidget(self.model_info_label)
         
         self.stats_text = QTextEdit()
+        self.stats_text.setObjectName("statsPanel")
         self.stats_text.setReadOnly(True)
-        self.stats_text.setMaximumHeight(200)
-        self.stats_text.setStyleSheet("background-color: #1e1e1e; color: #4ade80; font-family: monospace;")
+        self.stats_text.setMaximumHeight(140)
+        self.stats_text.setPlainText(
+            "No session data yet.\n\n"
+            "Recommended workflow:\n"
+            "- Start with 75% resize\n"
+            "- Use Ultra mode for live streams\n"
+            "- Keep tracker on Simple or SORT when tuning FPS"
+        )
         stats_layout.addWidget(self.stats_text)
         
         stats_group.setLayout(stats_layout)
@@ -720,7 +822,7 @@ class MainWindow(QMainWindow):
         
         # Status label
         self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("color: #666; padding: 10px;")
+        self.status_label.setObjectName("statusLine")
         right_panel.addWidget(self.status_label)
         
         right_panel.addStretch()
@@ -729,48 +831,387 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(left_panel, 3)
         
         # Wrap right panel in scroll area
-        from PyQt5.QtWidgets import QScrollArea
         right_widget = QWidget()
         right_widget.setLayout(right_panel)
         
-        scroll_area = QScrollArea()
-        scroll_area.setWidget(right_widget)
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_area.setMaximumWidth(420)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidget(right_widget)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_area.setMinimumWidth(350)
+        self.scroll_area.setMaximumWidth(420)
         
-        main_layout.addWidget(scroll_area, 1)
+        main_layout.addWidget(self.scroll_area, 1)
+        self.apply_theme()
+        self._refresh_custom_model_input()
+        self._sync_processing_mode_buttons()
+
+    def apply_theme(self):
+        """Apply cohesive UI theme for better readability and hierarchy."""
+        self.setStyleSheet("""
+            QWidget {
+                color: #1f2933;
+                font-family: "Segoe UI", "Trebuchet MS", sans-serif;
+                font-size: 12px;
+            }
+            QWidget#rootSurface {
+                background: #ece6da;
+            }
+            QGroupBox {
+                background: #fffdf8;
+                border: 1px solid #d6cab8;
+                border-radius: 16px;
+                margin-top: 10px;
+                padding: 10px 12px 12px 12px;
+                font-weight: 700;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #483628;
+                background: #ece6da;
+            }
+            QLabel#videoTitle {
+                color: #1b2733;
+                font-size: 18px;
+                font-weight: 700;
+                padding: 2px 2px 2px 2px;
+                letter-spacing: 0.4px;
+            }
+            QFrame#panelShell {
+                background: transparent;
+                border: none;
+            }
+            QFrame#runtimeCard {
+                background: #fffdf8;
+                border: 1px solid #d6cab8;
+                border-radius: 16px;
+                padding: 8px 10px;
+            }
+            QLabel#videoSurface {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                            stop:0 #081018, stop:1 #152533);
+                border: 1px solid #0f1b27;
+                border-radius: 18px;
+                color: #d8e5ef;
+                font-size: 14px;
+                font-weight: 600;
+            }
+            QLabel#fpsBadge {
+                color: #1f2933;
+                background: #fff7ed;
+                border: 1px solid #f0b47a;
+                border-radius: 10px;
+                padding: 7px 12px;
+            }
+            QLabel#metricChip {
+                background: #f5efe3;
+                color: #334155;
+                border: 1px solid #d8ccb7;
+                border-radius: 12px;
+                padding: 7px 12px;
+                font-weight: 700;
+            }
+            QLabel#statusLine {
+                color: #3a2a1d;
+                background: #fff7ed;
+                border: 1px solid #f3c892;
+                border-radius: 12px;
+                padding: 10px 12px;
+                font-weight: 600;
+            }
+            QLabel#subtleInfo {
+                color: #6a5543;
+                padding: 4px 6px;
+                background: transparent;
+            }
+            QToolButton {
+                background: #fff7ed;
+                color: #3a2a1d;
+                border: 1px solid #e0c39a;
+                border-radius: 12px;
+                padding: 8px 10px;
+                font-weight: 700;
+                text-align: left;
+            }
+            QToolButton:hover {
+                background: #ffedd5;
+            }
+            QLabel#modelChip {
+                background: #1b2733;
+                color: #f8d4a4;
+                padding: 10px 12px;
+                border-radius: 12px;
+                font-weight: 700;
+                font-size: 11px;
+            }
+            QLabel#summaryCard {
+                background: #f4ede1;
+                color: #433225;
+                border: 1px solid #e4d7c1;
+                border-radius: 12px;
+                padding: 10px 12px;
+                font-weight: 600;
+                line-height: 1.4;
+            }
+            QTextEdit#statsPanel {
+                background: #111c27;
+                color: #f8fafc;
+                border: 1px solid #293847;
+                border-radius: 14px;
+                font-family: "Consolas", "Courier New", monospace;
+                font-size: 11px;
+                padding: 10px;
+            }
+            QPushButton {
+                background: #e8ddd0;
+                color: #2a211a;
+                border: 1px solid #d7cab9;
+                border-radius: 12px;
+                padding: 8px 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #ddcfbf;
+            }
+            QPushButton:pressed {
+                background: #cdb9a4;
+            }
+            QPushButton:disabled {
+                background: #efe7dd;
+                color: #9a948e;
+                border-color: #e5ddd4;
+            }
+            QPushButton#primaryAction {
+                background: #0f766e;
+                color: white;
+                border-color: #115e59;
+            }
+            QPushButton#primaryAction:hover {
+                background: #0d9488;
+            }
+            QPushButton#accentAction {
+                background: #c96f16;
+                color: white;
+                border-color: #a65b12;
+            }
+            QPushButton#accentAction:hover {
+                background: #dd7f1d;
+            }
+            QPushButton#dangerAction {
+                background: #b42318;
+                color: white;
+                border-color: #912018;
+            }
+            QPushButton#dangerAction:hover {
+                background: #d92d20;
+            }
+            QPushButton#warnButton {
+                background: #f59e0b;
+                color: white;
+                border-color: #d97706;
+            }
+            QComboBox, QLineEdit, QTextEdit {
+                background: #fffdf8;
+                border: 1px solid #d7cab9;
+                border-radius: 10px;
+                padding: 7px;
+            }
+            QComboBox::drop-down {
+                border: none;
+            }
+            QComboBox QAbstractItemView {
+                background: #fffdf8;
+                selection-background-color: #d97706;
+                selection-color: white;
+            }
+            QSlider::groove:horizontal {
+                border: 1px solid #dfd2c2;
+                height: 6px;
+                background: #efe3d4;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #c96f16;
+                border: 1px solid #a65b12;
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+        """)
+
+    def _get_processing_mode(self) -> str:
+        """Return currently selected processing mode."""
+        if self.use_ultra_mode:
+            return "ultra"
+        if self.use_optimized_mode:
+            return "optimized"
+        if self.use_threaded_mode:
+            return "threaded"
+        return "standard"
+
+    def _set_processing_mode_flags(self, mode: str):
+        """Set mutually-exclusive processing mode flags."""
+        mode = (mode or "standard").strip().lower()
+        self.use_threaded_mode = mode == "threaded"
+        self.use_optimized_mode = mode == "optimized"
+        self.use_ultra_mode = mode == "ultra"
+
+    def _sync_processing_mode_buttons(self):
+        """Sync processing mode selector, badges, and helper text."""
+        mode = self._get_processing_mode()
+        descriptions = {
+            "standard": "Standard keeps the richest labels and analytics.",
+            "threaded": "Threaded overlaps work with safer parallelism.",
+            "optimized": "Optimized trims overlay cost for steadier playback.",
+            "ultra": "Ultra prioritizes lowest latency and highest live FPS.",
+        }
+
+        if hasattr(self, 'processing_mode_combo'):
+            index = self.processing_mode_combo.findData(mode)
+            if index >= 0:
+                self.processing_mode_combo.blockSignals(True)
+                self.processing_mode_combo.setCurrentIndex(index)
+                self.processing_mode_combo.blockSignals(False)
+
+        if hasattr(self, 'processing_mode_hint'):
+            self.processing_mode_hint.setText(descriptions.get(mode, descriptions["standard"]))
+
+        if hasattr(self, 'mode_badge'):
+            self.mode_badge.setText(f"Mode: {mode.title()}")
+
+    def _apply_processing_mode(self, mode: str, trigger_reload: bool = True):
+        """
+        Apply processing mode with strict mutual exclusivity.
+        """
+        self._set_processing_mode_flags(mode)
+        self._sync_processing_mode_buttons()
+
+        current_mode = self._get_processing_mode()
+        if current_mode == "standard":
+            self.status_label.setText("Standard mode enabled")
+        else:
+            self.status_label.setText(f"{current_mode.title()} mode enabled (reloading...)")
+
+        if trigger_reload:
+            if self.video_thread and self.video_thread.isRunning():
+                self.pending_reload_models = True
+                self.auto_reload_if_running(reason=f"Switching to {current_mode.title()} mode...")
+            else:
+                self.load_models()
+
+    def _get_tracker_display_name(self, tracker) -> str:
+        """Map tracker instance to UI label."""
+        if tracker is None:
+            return self.tracker_combo.currentText()
+
+        name = tracker.__class__.__name__.lower()
+        if "simple" in name:
+            return "Simple (Ultra Fast)"
+        if "sort" in name and "deepsort" not in name:
+            return "SORT (Fast)"
+        return "DeepSORT (Stable)"
+
+    def _sync_tracker_combo_with_runtime(self):
+        """Keep tracker combo aligned with actual tracker in use."""
+        runtime_name = self._get_tracker_display_name(self.tracker)
+        if self.tracker_combo.currentText() == runtime_name:
+            return
+        index = self.tracker_combo.findText(runtime_name)
+        if index >= 0:
+            self.tracker_combo.blockSignals(True)
+            self.tracker_combo.setCurrentIndex(index)
+            self.tracker_combo.blockSignals(False)
+        app_state.tracker_choice = runtime_name
+
+    def _resolve_model_selection(self, selection: str = None, prompt_for_custom: bool = False) -> bool:
+        """Map the single model selector to the runtime model configuration."""
+        selection = selection or self.model_combo.currentText()
+        profile_map = {
+            "YOLOv26n (GPU Recommended)": ("YOLOv26n (Fastest)", "None (Use base YOLO only)"),
+            "YOLOv8n": ("YOLOv8n", "None (Use base YOLO only)"),
+            "YOLOv11n": ("YOLOv11n", "None (Use base YOLO only)"),
+            "YOLOv11s (Fast)": ("YOLOv11s (Fast)", "None (Use base YOLO only)"),
+            "Train1 (Person model)": ("YOLOv26n (Fastest)", "Train1 (Person only) - ../best.pt"),
+            "Train2 (Multi-class)": ("YOLOv26n (Fastest)", "Train2 (Multi-class) - ../Train2/best.pt"),
+        }
+
+        if selection == "Custom model...":
+            if prompt_for_custom:
+                return self.browse_custom_model()
+
+            if not self.custom_model_path:
+                return False
+
+            app_state.model_choice = "YOLOv26n (Fastest)"
+            app_state.best_model_choice = f"Custom: {self.custom_model_path}"
+            self._refresh_custom_model_input()
+            return True
+
+        self.last_model_selection = selection
+        base_model, best_model = profile_map.get(
+            selection,
+            ("YOLOv26n (Fastest)", "None (Use base YOLO only)")
+        )
+        self.custom_model_path = None
+        app_state.model_choice = base_model
+        app_state.best_model_choice = best_model
+        self._refresh_custom_model_input()
+        return True
         
     def load_models(self):
         """Load YOLO models and tracker"""
         self.status_label.setText("Loading models...")
+        self._sync_processing_mode_buttons()
         QApplication.processEvents()
         
         try:
             # Set model choice in app state
-            app_state.model_choice = self.model_combo.currentText()
             app_state.tracker_choice = self.tracker_combo.currentText()
+            if not self._resolve_model_selection(self.model_combo.currentText(), prompt_for_custom=False):
+                self.status_label.setText("Select a valid model first")
+                return
+            lowered_confidence = self._apply_recommended_confidence_for_model()
             
             self.model_person, self.model_vehicle = load_yolo_models()
             self.tracker = initialize_tracker(self.tracker_combo.currentText())
+            self._sync_tracker_combo_with_runtime()
+            app_state.tracker_choice = self._get_tracker_display_name(self.tracker)
+            actual_backends = []
+            for model in (self.model_person, self.model_vehicle):
+                backend_name = self._identify_model_backend(model)
+                if backend_name not in actual_backends:
+                    actual_backends.append(backend_name)
+            gpu_backend_active = any("CUDA" in backend for backend in actual_backends)
+            cpu_only_mode = not gpu_backend_active
+            selected_mode = self._get_processing_mode()
             
             # Create processor (ultra, optimized, threaded, or standard)
-            if self.use_ultra_mode:
+            if selected_mode == "ultra":
                 from video_processor_ultra import UltraVideoProcessor
                 self.processor = UltraVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
-                print("✅ Using Ultra Processor (Async Pipeline - Max FPS)")
-            elif self.use_optimized_mode:
+                print("Using Ultra Processor")
+            elif selected_mode == "optimized":
                 from video_processor_optimized import VideoProcessorOptimized
                 self.processor = VideoProcessorOptimized(self.model_person, self.model_vehicle, self.tracker)
-                print("✅ Using Optimized Processor (Zero-Copy)")
-            elif self.use_threaded_mode:
+                print("Using Optimized Processor")
+            elif selected_mode == "threaded":
                 from video_processor_threaded import ThreadedVideoProcessor
                 self.processor = ThreadedVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
-                print("✅ Using Threaded Processor (Parallel)")
+                print("Using Threaded Processor")
+            elif cpu_only_mode:
+                from video_processor_ultra import UltraVideoProcessor
+                self.processor = UltraVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
+                print("Using Ultra Processor (CPU fallback)")
             else:
                 self.processor = VideoProcessor(self.model_person, self.model_vehicle, self.tracker)
-                print("✅ Using Standard Processor")
+                print("Using Standard Processor")
                 
             self.processor.set_confidence(self.confidence_slider.value() / 100.0)
             
@@ -780,105 +1221,300 @@ class MainWindow(QMainWindow):
             # Update model info display
             self.update_model_info()
             
-            self.status_label.setText(f"✅ Models loaded: {app_state.model_choice}")
+            backend_text = " + ".join(actual_backends) if actual_backends else "CPU"
+            display_model_name = self._get_selected_model_display_name()
+
+            if cpu_only_mode and all("CPU" in backend for backend in actual_backends):
+                self.status_label.setText(f"Models loaded: {display_model_name} | Backend: CPU")
+            else:
+                self.status_label.setText(f"Models loaded: {display_model_name} | Backend: {backend_text}")
+            if lowered_confidence is not None:
+                self.status_label.setText(
+                    f"Models loaded: {display_model_name} | Backend: {backend_text} | Conf auto -> 0.{lowered_confidence:02d}"
+                )
             self.btn_load_video.setEnabled(True)
             self.btn_start_stream.setEnabled(True)
         except Exception as e:
-            self.status_label.setText(f"❌ Error loading models: {e}")
-    
-    def update_model_info(self):
-        """Update the model info display"""
+            self.status_label.setText(f"Error loading models: {e}")
+
+    def _has_torch_cuda(self) -> bool:
+        """Check whether torch has CUDA support in current runtime."""
         try:
-            # Check if using ONNX
+            import torch
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+
+    def _has_onnx_cuda_provider(self) -> bool:
+        """Check whether ONNX Runtime CUDA provider is available."""
+        try:
+            import onnxruntime
+            return 'CUDAExecutionProvider' in onnxruntime.get_available_providers()
+        except Exception:
+            return False
+
+    def _describe_source(self) -> str:
+        """Return a compact description of the active source."""
+        if not self.video_source:
+            return "Waiting"
+
+        if isinstance(self.video_source, int):
+            return f"Camera {self.video_source}"
+
+        source_text = str(self.video_source).strip()
+        if source_text.isdigit():
+            return f"Camera {source_text}"
+        if source_text.startswith(("rtsp://", "http://", "https://")):
+            return "Live URL"
+        return Path(source_text).name
+
+    def toggle_sidebar(self):
+        """Show or hide the right-side control panel."""
+        visible = not self.scroll_area.isVisible()
+        self.scroll_area.setVisible(visible)
+        self.btn_toggle_sidebar.setText("Hide Controls" if visible else "Show Controls")
+
+    def toggle_runtime_section(self):
+        """Collapse or expand the runtime overview card."""
+        expanded = self.runtime_toggle_button.isChecked()
+        self.runtime_panel.setVisible(expanded)
+        self.runtime_toggle_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+
+    def _open_file_dialog(self, title: str, file_filter: str):
+        """Open a modal file dialog that stays above the app window."""
+        dialog = QFileDialog(self, title, "", file_filter)
+        dialog.setFileMode(QFileDialog.ExistingFile)
+        dialog.setViewMode(QFileDialog.Detail)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        dialog.raise_()
+        dialog.activateWindow()
+        if dialog.exec_() == QDialog.Accepted:
+            files = dialog.selectedFiles()
+            if files:
+                return files[0], dialog.selectedNameFilter()
+        return "", ""
+
+    def _refresh_custom_model_input(self):
+        """Keep the custom model path field aligned with current selection."""
+        if self.custom_model_path:
+            path = Path(self.custom_model_path)
+            self.custom_model_input.setText(path.name)
+            self.custom_model_input.setToolTip(str(path))
+            self.btn_browse_custom_model.setText("Change...")
+        else:
+            self.custom_model_input.clear()
+            self.custom_model_input.setPlaceholderText("No custom model selected")
+            self.custom_model_input.setToolTip("")
+            self.btn_browse_custom_model.setText("Browse...")
+
+    def browse_custom_model(self):
+        """Select a custom detector file from disk."""
+        previous_selection = getattr(self, 'last_model_selection', "YOLOv26n (GPU Recommended)")
+        file_path, _ = self._open_file_dialog(
+            "Select Custom Detection Model",
+            "Model Files (*.pt *.onnx);;PyTorch Models (*.pt);;ONNX Models (*.onnx);;All Files (*.*)"
+        )
+        if not file_path:
+            if not self.custom_model_path:
+                index = self.model_combo.findText(previous_selection)
+                if index >= 0:
+                    self.model_combo.blockSignals(True)
+                    self.model_combo.setCurrentIndex(index)
+                    self.model_combo.blockSignals(False)
+            self.status_label.setText("Custom model selection canceled")
+            self._refresh_custom_model_input()
+            return False
+
+        self.custom_model_path = file_path
+        custom_index = self.model_combo.findText("Custom model...")
+        if custom_index >= 0 and self.model_combo.currentIndex() != custom_index:
+            self.model_combo.blockSignals(True)
+            self.model_combo.setCurrentIndex(custom_index)
+            self.model_combo.blockSignals(False)
+
+        self._refresh_custom_model_input()
+        if not self._resolve_model_selection("Custom model...", prompt_for_custom=False):
+            self.status_label.setText("Unable to apply custom model")
+            return False
+
+        if self.video_thread and self.video_thread.isRunning():
+            self.pending_reload_models = True
+            self.auto_reload_if_running(reason=f"Switching model to {Path(file_path).name}...")
+        else:
+            self.load_models()
+        return True
+
+    def _get_selected_model_display_name(self) -> str:
+        """Return the label the user expects to see in the UI."""
+        selection = self.model_combo.currentText()
+        if selection == "Custom model..." and self.custom_model_path:
+            return f"Custom ({Path(self.custom_model_path).name})"
+        return selection
+
+    def _is_trained_model_selection(self) -> bool:
+        """Return True for custom or trained detector profiles."""
+        selection = self.model_combo.currentText()
+        return selection in {
+            "Train1 (Person model)",
+            "Train2 (Multi-class)",
+            "Custom model...",
+        }
+
+    def _apply_recommended_confidence_for_model(self):
+        """
+        Trained models in this project tend to emit lower confidence scores than
+        the stock YOLO profiles. Lower the threshold automatically so the user
+        does not end up with a blank frame after switching models.
+        """
+        if not self._is_trained_model_selection():
+            return None
+
+        recommended = 25
+        current = self.confidence_slider.value()
+        if current <= recommended:
+            return None
+
+        self.confidence_slider.setValue(recommended)
+        return recommended
+
+    def _get_loaded_model_name(self, model) -> str:
+        """Return the actual loaded model filename when available."""
+        loaded_name = getattr(model, '_loaded_model_name', None)
+        if loaded_name:
+            return loaded_name
+        return self._get_selected_model_display_name()
+
+    def _identify_model_backend(self, model) -> str:
+        """Identify the backend used by a model instance."""
+        if model is None:
+            return "Not loaded"
+
+        try:
+            from onnx_model import ONNXModel
+            if isinstance(model, ONNXModel):
+                providers = model.session.get_providers()
+                if providers and providers[0] == 'CUDAExecutionProvider':
+                    return "ONNX CUDA"
+                return "ONNX CPU"
+        except Exception:
+            pass
+
+        try:
+            if hasattr(model, 'model'):
+                device = str(next(model.model.parameters()).device)
+                return "Torch CUDA" if device.startswith("cuda") else "Torch CPU"
+        except Exception:
+            pass
+
+        return "Unknown"
+
+    def _refresh_runtime_overview(self):
+        """Refresh runtime badges and summary card."""
+        person_backend = self._identify_model_backend(self.model_person)
+        vehicle_backend = self._identify_model_backend(self.model_vehicle)
+        tracker_text = self._get_tracker_display_name(self.tracker)
+        mode_text = self._get_processing_mode().title()
+        source_text = self._describe_source()
+        profile_text = self._get_selected_model_display_name()
+        person_model_name = self._get_loaded_model_name(self.model_person)
+        vehicle_model_name = self._get_loaded_model_name(self.model_vehicle)
+        shared_detector = self.model_person is not None and self.model_person is self.model_vehicle
+
+        backends = []
+        for backend in (person_backend, vehicle_backend):
+            if backend not in backends:
+                backends.append(backend)
+        backend_text = " + ".join(backends) if backends else "Detecting"
+
+        if hasattr(self, 'backend_badge'):
+            self.backend_badge.setText(f"Backend: {backend_text}")
+        if hasattr(self, 'tracker_badge'):
+            self.tracker_badge.setText(f"Tracker: {tracker_text}")
+        if hasattr(self, 'source_badge'):
+            self.source_badge.setText(f"Source: {source_text}")
+        if hasattr(self, 'mode_badge'):
+            self.mode_badge.setText(f"Mode: {mode_text}")
+
+        if self._is_trained_model_selection():
+            hint = "Custom/train models in this project usually work best around confidence 0.20-0.35. If the frame looks empty, lower the threshold first."
+        elif "CPU" in backend_text and self._has_torch_cuda():
+            hint = "GPU torch is ready, but at least one model still runs on CPU. Custom .pt models benefit most from CUDA or an ONNX export."
+        elif "CPU" in backend_text and self._has_onnx_cuda_provider():
+            hint = "ONNX CUDA is available. Models with sibling .onnx files will run much faster than raw .pt on CPU."
+        elif "CUDA" in backend_text:
+            hint = "GPU acceleration is active. Use Ultra mode + 75% resize for the best livestream responsiveness."
+        else:
+            hint = "Load models and source to inspect the active pipeline."
+
+        if hasattr(self, 'runtime_hint_label'):
+            self.runtime_hint_label.setText(hint)
+
+        if hasattr(self, 'runtime_summary_label'):
+            self.runtime_summary_label.setText(
+                f"Profile: {profile_text}\n"
+                f"Detector: {person_model_name}{' (shared)' if shared_detector else ''}\n"
+                f"Person model: {person_backend}\n"
+                f"Vehicle model: {vehicle_backend} [{vehicle_model_name}]\n"
+                f"Tracker: {tracker_text}\n"
+                f"Source: {source_text}"
+            )
+
+    def update_model_info(self):
+        """Update the model info display."""
+        try:
             using_onnx = False
             onnx_available = False
-            gpu_provider = False
+            onnx_cuda = False
             try:
                 from onnx_model import ONNXModel
                 import onnxruntime
                 onnx_available = True
-                if isinstance(self.model_person, ONNXModel) or isinstance(self.model_vehicle, ONNXModel):
-                    using_onnx = True
-                    # Check if GPU provider
-                    if 'CUDAExecutionProvider' in onnxruntime.get_available_providers():
-                        gpu_provider = True
-            except:
+                using_onnx = isinstance(self.model_person, ONNXModel) or isinstance(self.model_vehicle, ONNXModel)
+                onnx_cuda = 'CUDAExecutionProvider' in onnxruntime.get_available_providers()
+            except Exception:
                 pass
-            
-            # Get model names
-            base_model = app_state.model_choice
-            best_model = app_state.best_model_choice
-            tracker_type = app_state.tracker_choice
-            
-            # Build info text
-            info_lines = []
-            
-            # Model info - handle Custom case
-            if "Custom:" in best_model:
-                # Extract filename from "Custom: /path/to/file.onnx"
-                custom_path = best_model.replace("Custom: ", "").strip()
-                custom_name = Path(custom_path).name
-                info_lines.append(f"📦 Custom: {custom_name}")
-            elif "None" in best_model:
-                info_lines.append(f"📦 {base_model}")
-            elif "Train2" in best_model:
-                info_lines.append(f"📦 Train2 + {base_model}")
-            elif "Train1" in best_model:
-                info_lines.append(f"📦 Train1 + {base_model}")
-            else:
-                info_lines.append(f"📦 {base_model}")
-            
-            # ONNX status with GPU info
-            if using_onnx:
-                if gpu_provider:
-                    info_lines.append("🚀 ONNX GPU (Fast)")
-                else:
-                    info_lines.append("🚀 ONNX CPU")
-            elif onnx_available:
-                info_lines.append("⚠️ PyTorch (Slow)")
-            else:
-                info_lines.append("⚠️ PyTorch")
-            
-            # Tracker info
-            if "Simple" in tracker_type:
-                info_lines.append("⚡ Simple Tracker")
-            else:
-                info_lines.append("🎯 DeepSort Tracker")
-            
-            # Update label
+
+            selected_profile = self._get_selected_model_display_name()
+            tracker_type = self._get_tracker_display_name(self.tracker)
+            mode = self._get_processing_mode().title()
+            actual_person_backend = self._identify_model_backend(self.model_person)
+            actual_vehicle_backend = self._identify_model_backend(self.model_vehicle)
+
+            info_lines = [f"Model: {selected_profile}"]
+            info_lines.append(f"Person Backend: {actual_person_backend} [{self._get_loaded_model_name(self.model_person)}]")
+            info_lines.append(f"Vehicle Backend: {actual_vehicle_backend} [{self._get_loaded_model_name(self.model_vehicle)}]")
+
+            info_lines.append(f"Tracker: {tracker_type}")
+            info_lines.append(f"Mode: {mode}")
             self.model_info_label.setText("\n".join(info_lines))
-            
-        except Exception as e:
-            self.model_info_label.setText(f"Model: {app_state.model_choice}")
-            
+            self._refresh_runtime_overview()
+
+        except Exception:
+            self.model_info_label.setText(f"Model: {self.model_combo.currentText()}")
+            self._refresh_runtime_overview()
+
     def on_model_changed(self, model_name):
         """Handle model selection change"""
-        self.status_label.setText(f"🔄 Switching to {model_name}...")
-        QApplication.processEvents()  # Update UI immediately
-        
-        # Update app state
-        app_state.model_choice = model_name
-        
-        # Reload models (no cache in PyQt5)
         try:
-            self.model_person, self.model_vehicle = load_yolo_models()
-            if self.processor:
-                self.processor.model_person = self.model_person
-                self.processor.model_vehicle = self.model_vehicle
-                # Update using_train2 flag
-                self.processor.using_train2 = "Train2" in app_state.best_model_choice
-            
-            # Update model info display
-            self.update_model_info()
-            
-            self.status_label.setText(f"✅ Switched to {model_name}")
-            
-            # Auto-reload if running
-            self.auto_reload_if_running()
+            if model_name == "Custom model...":
+                QTimer.singleShot(0, self.browse_custom_model)
+                return
+            if not self._resolve_model_selection(model_name, prompt_for_custom=True):
+                self.status_label.setText("Model selection canceled")
+                return
+            if self.video_thread and self.video_thread.isRunning():
+                self.pending_reload_models = True
+                self.auto_reload_if_running(reason=f"Switching model to {model_name}...")
+            else:
+                self.load_models()
         except Exception as e:
-            self.status_label.setText(f"❌ Error loading {model_name}: {e}")
+            self.status_label.setText(f"Error loading {model_name}: {e}")
     
     def on_best_model_changed(self, best_model_name):
+        """Legacy handler kept for compatibility with older code paths."""
+        self.status_label.setText(f"Legacy model selector ignored: {best_model_name}")
+        return
+
         """Handle best.pt model selection change"""
         # Check if user selected "Custom"
         if "Custom" in best_model_name:
@@ -908,52 +1544,36 @@ class MainWindow(QMainWindow):
             # Update app state
             app_state.best_model_choice = best_model_name
         
-        # Reload models (no cache in PyQt5)
         try:
-            self.model_person, self.model_vehicle = load_yolo_models()
-            if self.processor:
-                self.processor.model_person = self.model_person
-                self.processor.model_vehicle = self.model_vehicle
-                # Update using_train2 flag
-                self.processor.using_train2 = "Train2" in app_state.best_model_choice
-            
-            # Check if using ONNX
-            onnx_status = ""
-            try:
-                from onnx_model import ONNXModel
-                if isinstance(self.model_person, ONNXModel) or isinstance(self.model_vehicle, ONNXModel):
-                    onnx_status = " 🚀 ONNX"
-            except:
-                pass
-            
-            # Update status message based on selection
-            if "None" in best_model_name:
-                self.status_label.setText(f"✅ Using base YOLO only (no custom training){onnx_status}")
-            elif "Train2" in best_model_name:
-                self.status_label.setText(f"✅ Using Train2 best.pt (multi-class detection){onnx_status}")
-            elif "Train1" in best_model_name:
-                self.status_label.setText(f"✅ Using Train1 best.pt (person only){onnx_status}")
-            elif "Custom" in best_model_name:
-                self.status_label.setText(f"✅ Using custom model: {Path(self.custom_model_path).name}{onnx_status}")
-            
-            # Update model info display
-            self.update_model_info()
-            
-            # Auto-reload if running
-            self.auto_reload_if_running()
+            if self.video_thread and self.video_thread.isRunning():
+                self.pending_reload_models = True
+                self.auto_reload_if_running(reason="Reloading trained model...")
+            else:
+                self.load_models()
+                if "None" in best_model_name:
+                    self.status_label.setText("Using base YOLO only")
+                elif "Train2" in best_model_name:
+                    self.status_label.setText("Using Train2 multi-class model")
+                elif "Train1" in best_model_name:
+                    self.status_label.setText("Using Train1 person model")
+                elif "Custom" in best_model_name and self.custom_model_path:
+                    self.status_label.setText(f"Using custom model: {Path(self.custom_model_path).name}")
         except Exception as e:
-            self.status_label.setText(f"❌ Error loading {best_model_name}: {e}")
+            self.status_label.setText(f"Error loading {best_model_name}: {e}")
         
     def on_tracker_changed(self, tracker_name):
         """Handle tracker selection change"""
-        if self.processor:
-            self.tracker = initialize_tracker(tracker_name)
-            self.processor.tracker = self.tracker
-            self.status_label.setText(f"Tracker changed to {tracker_name}")
-            
-            # Auto-reload if running
-            self.auto_reload_if_running()
-            
+        app_state.tracker_choice = tracker_name
+        try:
+            if self.video_thread and self.video_thread.isRunning():
+                self.pending_reload_models = True
+                self.auto_reload_if_running(reason=f"Switching tracker to {tracker_name}...")
+            else:
+                self.load_models()
+                self.status_label.setText(f"Tracker changed to {self._get_tracker_display_name(self.tracker)}")
+        except Exception as e:
+            self.status_label.setText(f"Error changing tracker: {e}")
+
     def on_confidence_changed(self, value):
         """Handle confidence threshold change"""
         conf = value / 100.0
@@ -987,10 +1607,10 @@ class MainWindow(QMainWindow):
         # Update button text and style
         if checked:
             self.btn_display_mode.setText("🎯 Display: Point Label")
-            self.btn_display_mode.setStyleSheet("background-color: #3b82f6; color: white;")
+            self.btn_display_mode.setStyleSheet("background-color: #0f766e; color: white;")
         else:
             self.btn_display_mode.setText("📦 Display: Bounding Box")
-            self.btn_display_mode.setStyleSheet("background-color: #8b5cf6; color: white;")
+            self.btn_display_mode.setStyleSheet("background-color: #475569; color: white;")
     
     def toggle_trail(self, checked):
         """Toggle trail drawing"""
@@ -998,24 +1618,27 @@ class MainWindow(QMainWindow):
         if checked:
             config.TRAIL_LENGTH = 3  # Enable trail
             self.btn_trail_toggle.setText("🟢 Trail: ON")
-            self.btn_trail_toggle.setStyleSheet("background-color: #22c55e; color: white;")
+            self.btn_trail_toggle.setStyleSheet("background-color: #15803d; color: white;")
         else:
             config.TRAIL_LENGTH = 0  # Disable trail
             self.btn_trail_toggle.setText("🔴 Trail: OFF")
-            self.btn_trail_toggle.setStyleSheet("background-color: #ef4444; color: white;")
+            self.btn_trail_toggle.setStyleSheet("background-color: #b42318; color: white;")
     
     def manual_cleanup(self):
         """Manual memory cleanup"""
-        self.status_label.setText("🧹 Cleaning cache...")
+        self.status_label.setText("Cleaning cache...")
         QApplication.processEvents()
         
         try:
             # Clear processor cache
             if self.processor:
-                self.processor.trails.clear()
-                if hasattr(self.processor.tracker, 'tracks'):
+                trails = getattr(self.processor, 'trails', None)
+                if isinstance(trails, dict):
+                    trails.clear()
+                if hasattr(self.processor, 'tracker') and hasattr(self.processor.tracker, 'tracks'):
                     self.processor.tracker.tracks.clear()
-                self.processor.frame_counter = 0
+                if hasattr(self.processor, 'frame_counter'):
+                    self.processor.frame_counter = 0
             
             # Clear Python garbage
             import gc
@@ -1026,37 +1649,34 @@ class MainWindow(QMainWindow):
                 import torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    print("✅ CUDA cache cleared")
-            except:
+                    print("CUDA cache cleared")
+            except Exception:
                 pass
             
-            self.status_label.setText("✅ Cache cleared!")
-            QTimer.singleShot(2000, lambda: self.status_label.setText("▶️ Running"))
+            self.status_label.setText("Cache cleared")
+            QTimer.singleShot(
+                1500,
+                lambda: self.status_label.setText("Processing..." if self.video_thread and self.video_thread.isRunning() else "Ready")
+            )
         except Exception as e:
-            self.status_label.setText(f"⚠️ Cleanup error: {e}")
-    
+            self.status_label.setText(f"Cleanup error: {e}")
+
     def toggle_threaded_mode(self, checked):
-        """Toggle threaded processing mode"""
-        self.use_threaded_mode = checked
-        if checked:
-            self.btn_threaded_mode.setText("🚀 Multi-Threading: ON")
-            self.btn_threaded_mode.setStyleSheet("background-color: #22c55e; color: white;")
-        else:
-            self.btn_threaded_mode.setText("🚀 Multi-Threading: OFF")
-            self.btn_threaded_mode.setStyleSheet("background-color: #ef4444; color: white;")
-        
-        # Reload if running
-        if self.video_thread and self.video_thread.isRunning():
-            self.status_label.setText("🔄 Switching mode...")
-            QApplication.processEvents()
-            self.stop_processing()
-            QTimer.singleShot(500, self.start_processing)
-    
+        """Toggle threaded processing mode."""
+        self._apply_processing_mode("threaded" if checked else "standard")
+
+    def on_processing_mode_changed(self, index):
+        """Handle processing mode selection from combo box."""
+        mode = self.processing_mode_combo.itemData(index)
+        if mode:
+            self._apply_processing_mode(mode)
+
     def on_max_det_changed(self, value):
         """Handle max detections change"""
         self.max_det = value
         self.max_det_label.setText(f"{value} objects")
+        if self.video_thread and self.video_thread.isRunning():
+            self.video_thread.max_det = value
     
     def on_tracker_age_changed(self, value):
         """Handle tracker max age change"""
@@ -1069,26 +1689,44 @@ class MainWindow(QMainWindow):
         if self.tracker:
             if hasattr(self.tracker, 'max_age'):
                 self.tracker.max_age = value
-    
-    def auto_reload_if_running(self):
-        """Auto-reload stream/video if currently running"""
+
+    def on_frame_skip_changed(self, value):
+        """Apply frame skip live without restarting the stream."""
+        self.frame_skip_label.setText(f"Skip: {value} frames")
         if self.video_thread and self.video_thread.isRunning():
-            # Visual feedback
-            self.status_label.setText("🔄 Applying changes...")
-            self.status_label.setStyleSheet("color: #fbbf24; font-weight: bold;")
-            QApplication.processEvents()
-            
-            # Stop current processing
-            self.stop_processing()
-            
-            # Restart after short delay with success message
-            def restart_with_feedback():
-                self.start_processing()
-                self.status_label.setText("✅ Settings applied!")
-                self.status_label.setStyleSheet("color: #4ade80; font-weight: bold;")
-                QTimer.singleShot(2000, lambda: self.status_label.setStyleSheet("color: #666; padding: 10px;"))
-            
-            QTimer.singleShot(300, restart_with_feedback)
+            self.video_thread.frame_skip = value
+
+    def on_resize_changed(self, text):
+        """Apply resize scale live when possible."""
+        resize_scale = int(text.split()[0].replace('%', ''))
+        if self.video_thread and self.video_thread.isRunning():
+            self.video_thread.resize_scale = resize_scale
+
+    def auto_reload_if_running(self, reason="Applying changes..."):
+        """Debounce a heavy restart only when the current source is running."""
+        if self.video_thread and self.video_thread.isRunning():
+            self.pending_restart = True
+            self.restart_message = reason
+            self.status_label.setText(reason)
+            self.restart_timer.start(180)
+
+    def _apply_pending_restart(self):
+        """Commit the queued restart after debounce window."""
+        if not self.pending_restart:
+            return
+
+        if self.video_thread and self.video_thread.isRunning():
+            self.stop_processing(preserve_pending=True)
+            return
+
+        reload_models = self.pending_reload_models
+        self.pending_restart = False
+        self.pending_reload_models = False
+        self.restart_message = ""
+        if reload_models:
+            self.load_models()
+        if self.video_source:
+            self.start_processing()
     
     def apply_preset(self, frame_skip, resize_scale):
         """Apply performance preset"""
@@ -1104,65 +1742,24 @@ class MainWindow(QMainWindow):
         # Auto-reload if running (will be triggered by slider/combo change events)
     
     def toggle_optimized_mode(self, checked):
-        """Toggle optimized processor mode"""
-        self.use_optimized_mode = checked
-        if checked:
-            self.btn_optimized_mode.setText("⚡ Optimized Mode: ON")
-            self.btn_optimized_mode.setStyleSheet("background-color: #4ade80; color: white;")
-            self.status_label.setText("✅ Optimized mode enabled (reloading...)")
-            
-            # Disable threaded mode (mutually exclusive recommendation)
-            if self.use_threaded_mode:
-                self.btn_threaded_mode.setChecked(False)
-                self.toggle_threaded_mode(False)
-        else:
-            self.btn_optimized_mode.setText("⚡ Optimized Mode: OFF")
-            self.btn_optimized_mode.setStyleSheet("background-color: #ef4444; color: white;")
-            self.status_label.setText("✅ Optimized mode disabled (reloading...)")
-        
-        # Reload to apply changes (must recreate processor)
-        self.load_models()
-        self.auto_reload_if_running()
-    
+        """Toggle optimized processor mode."""
+        self._apply_processing_mode("optimized" if checked else "standard")
+
     def toggle_ultra_mode(self, checked):
-        """Toggle ultra processor mode (async double-buffer pipeline)"""
-        self.use_ultra_mode = checked
-        if checked:
-            self.btn_ultra_mode.setText("🔥 Ultra Mode: ON")
-            self.btn_ultra_mode.setStyleSheet("background-color: #f97316; color: white;")  # Orange for ultra
-            self.status_label.setText("✅ Ultra mode enabled (50+ FPS, reloading...)")
-            
-            # Disable other modes (mutually exclusive)
-            if self.use_optimized_mode:
-                self.btn_optimized_mode.setChecked(False)
-                self.use_optimized_mode = False
-                self.btn_optimized_mode.setText("⚡ Optimized Mode: OFF")
-                self.btn_optimized_mode.setStyleSheet("background-color: #ef4444; color: white;")
-            if self.use_threaded_mode:
-                self.btn_threaded_mode.setChecked(False)
-                self.use_threaded_mode = False
-                self.btn_threaded_mode.setText("🚀 Multi-Threading: OFF")
-                self.btn_threaded_mode.setStyleSheet("background-color: #ef4444; color: white;")
-        else:
-            self.btn_ultra_mode.setText("🔥 Ultra Mode: OFF")
-            self.btn_ultra_mode.setStyleSheet("background-color: #ef4444; color: white;")
-            self.status_label.setText("✅ Ultra mode disabled (reloading...)")
-        
-        # Reload to apply changes
-        self.load_models()
-        self.auto_reload_if_running()
-    
+        """Toggle ultra processor mode (async double-buffer pipeline)."""
+        self._apply_processing_mode("ultra" if checked else "standard")
+
     def toggle_smooth_mode(self, checked, button):
         """Toggle smooth mode for frame interpolation"""
         self.smooth_mode = checked
         if checked:
             button.setText("🎬 Smooth Mode: ON")
-            button.setStyleSheet("background-color: #4ade80; color: white;")
-            self.status_label.setText("✅ Smooth mode enabled (frame interpolation)")
+            button.setStyleSheet("background-color: #15803d; color: white;")
+            self.status_label.setText("Smooth mode enabled")
         else:
             button.setText("🎬 Smooth Mode: OFF")
             button.setStyleSheet("")
-            self.status_label.setText("✅ Smooth mode disabled (accurate frames only)")
+            self.status_label.setText("Smooth mode disabled")
         
         # Update thread if running
         if self.video_thread and self.video_thread.isRunning():
@@ -1173,8 +1770,8 @@ class MainWindow(QMainWindow):
         self.roi_drawing_mode = checked
         if checked:
             self.btn_draw_roi.setText("✏️ Drawing... (Click to add points)")
-            self.btn_draw_roi.setStyleSheet("background-color: #fbbf24; color: white;")
-            self.status_label.setText("🖊️ Click on video to draw ROI polygon. Right-click to finish.")
+            self.btn_draw_roi.setStyleSheet("background-color: #c96f16; color: white;")
+            self.status_label.setText("Click on video to draw ROI polygon. Right-click to finish.")
             self.roi_temp_points = []
         else:
             self.btn_draw_roi.setText("✏️ Draw ROI")
@@ -1183,9 +1780,9 @@ class MainWindow(QMainWindow):
                 # Finalize ROI
                 self.roi_manager.set_points(self.roi_temp_points)
                 self.update_roi_status()
-                self.status_label.setText(f"✅ ROI set with {len(self.roi_temp_points)} points")
+                self.status_label.setText(f"ROI set with {len(self.roi_temp_points)} points")
             else:
-                self.status_label.setText("⚠️ ROI needs at least 3 points")
+                self.status_label.setText("ROI needs at least 3 points")
             self.roi_temp_points = []
     
     def on_video_label_click(self, event):
@@ -1281,6 +1878,8 @@ class MainWindow(QMainWindow):
         else:
             self.btn_toggle_roi.setText("👁️ Hide")
             self.status_label.setText("👁️ ROI overlay visible")
+
+        self.video_label.update()
     
     def clear_roi(self):
         """Clear ROI"""
@@ -1292,6 +1891,7 @@ class MainWindow(QMainWindow):
         self.btn_draw_roi.setStyleSheet("")
         self.update_roi_status()
         self.status_label.setText("🗑️ ROI cleared")
+        self.video_label.update()
     
     def save_roi(self):
         """Save ROI configuration to file"""
@@ -1358,6 +1958,7 @@ class MainWindow(QMainWindow):
             self.video_source = file_path
             self.status_label.setText(f"Loaded: {Path(file_path).name}")
             self.btn_start.setEnabled(True)
+            self._refresh_runtime_overview()
             
     def start_livestream(self):
         """Start livestream processing"""
@@ -1459,6 +2060,7 @@ class MainWindow(QMainWindow):
                     return
             else:
                 self.video_source = stream_url
+                self._refresh_runtime_overview()
                 
         self.start_processing()
         
@@ -1466,6 +2068,9 @@ class MainWindow(QMainWindow):
         """Start video processing"""
         if not self.processor:
             self.status_label.setText("⚠️ Models not loaded")
+            return
+        if not self.video_source:
+            self.status_label.setText("Select a video file, stream URL, or camera first")
             return
             
         # Stop existing thread if running
@@ -1486,6 +2091,7 @@ class MainWindow(QMainWindow):
         self.video_thread.set_processor(self.processor)
         self.video_thread.set_params(frame_skip, resize_scale)
         self.video_thread.max_det = self.max_det  # Pass max_det
+        self.video_thread.smooth_mode = self.smooth_mode
         self.video_thread.frame_ready.connect(self.update_frame)
         self.video_thread.finished.connect(self.on_processing_finished)
         self.video_thread.start()
@@ -1495,125 +2101,158 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(True)
         self.btn_load_video.setEnabled(False)
         self.btn_start_stream.setEnabled(False)
-        self.status_label.setText("▶️ Processing...")
+        self.status_label.setText("Processing...")
         
         # Reset FPS counter
         self.fps_counter = 0
         self.fps_start_time = time.time()
         self.fps_history = []  # Clear FPS history
+        self.last_display_time = 0.0
+        self._refresh_runtime_overview()
         
-    def stop_processing(self):
+    def stop_processing(self, preserve_pending=False):
         """Stop video processing"""
+        if not preserve_pending:
+            self.pending_restart = False
+            self.pending_reload_models = False
+            self.restart_timer.stop()
         if self.video_thread:
             self.video_thread.stop()
             self.video_thread.wait()
             
     def on_processing_finished(self):
         """Handle processing finished"""
+        if self.pending_restart:
+            self.pending_restart = False
+            reload_models = self.pending_reload_models
+            self.pending_reload_models = False
+            self.restart_message = ""
+            if reload_models:
+                self.load_models()
+            self.start_processing()
+            return
+
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_load_video.setEnabled(True)
         self.btn_start_stream.setEnabled(True)
-        self.status_label.setText("⏹️ Stopped")
+        self.status_label.setText("Stopped")
+        self._refresh_runtime_overview()
         
     def update_frame(self, frame, stats):
         """Update video display with processed frame - OPTIMIZED"""
+        # Render throttle to reduce UI thread overhead
+        now = time.perf_counter()
+        if (now - self.last_display_time) < self.display_frame_interval:
+            return
+        self.last_display_time = now
+
+        # Always render on a writable copy so UI overlays behave consistently
+        # across Standard / Threaded / Optimized / Ultra processor modes.
+        frame = frame.copy()
+
         # Store original frame size for ROI coordinate mapping
         original_h, original_w = frame.shape[:2]
         self.current_frame_size = (original_w, original_h)
+
+        # Draw finalized ROI overlay in the UI layer so it remains visible even
+        # when the active processor mode skips ROI drawing for performance.
+        if self.roi_manager and self.roi_manager.is_active():
+            self.roi_manager.draw_roi(frame)
         
         # Draw temporary ROI points if in drawing mode (on original frame)
         if self.roi_drawing_mode and len(self.roi_temp_points) > 0:
-            # Draw temporary points and lines on the frame
             for i, point in enumerate(self.roi_temp_points):
-                # Draw larger circles for visibility
-                cv2.circle(frame, point, 8, (0, 255, 255), -1)  # Yellow fill
-                cv2.circle(frame, point, 10, (0, 0, 0), 2)  # Black outline
-                
-                # Draw point number
-                cv2.putText(frame, str(i+1), (point[0]+12, point[1]+5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
-                # Draw lines between points
+                cv2.circle(frame, point, 8, (0, 255, 255), -1)
+                cv2.circle(frame, point, 10, (0, 0, 0), 2)
+                cv2.putText(frame, str(i + 1), (point[0] + 12, point[1] + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 if i > 0:
-                    cv2.line(frame, self.roi_temp_points[i-1], point, (0, 255, 255), 3)
-            
-            # Draw closing line if we have 3+ points
+                    cv2.line(frame, self.roi_temp_points[i - 1], point, (0, 255, 255), 3)
+
             if len(self.roi_temp_points) >= 3:
-                # Draw dashed line by drawing short segments
                 p1 = self.roi_temp_points[-1]
                 p2 = self.roi_temp_points[0]
-                # Simple dashed line effect
                 cv2.line(frame, p1, p2, (0, 255, 255), 2)
-            
-            # Draw text
-            text = f"ROI: {len(self.roi_temp_points)} points (Right-click to finish)"
-            cv2.putText(frame, text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.7, (0, 255, 255), 2)
-        
-        # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_frame.shape
+
+            text_overlay = f"ROI: {len(self.roi_temp_points)} points (Right-click to finish)"
+            cv2.putText(frame, text_overlay, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        # Use BGR888 directly to avoid cvtColor overhead
+        if not frame.flags['C_CONTIGUOUS']:
+            frame = np.ascontiguousarray(frame)
+        h, w, ch = frame.shape
         bytes_per_line = ch * w
-        
-        # Create QImage
-        qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        
-        # Scale and display
+
+        if hasattr(QImage, "Format_BGR888"):
+            qt_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_BGR888)
+        else:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qt_image)
         scaled_pixmap = pixmap.scaled(
-            self.video_label.size(), 
-            Qt.KeepAspectRatio, 
-            Qt.FastTransformation  # Use Fast for better performance
+            self.video_label.size(),
+            Qt.KeepAspectRatio,
+            Qt.FastTransformation
         )
         self.video_label.setPixmap(scaled_pixmap)
-        
+
         # Update FPS counter
         self.fps_counter += 1
         elapsed = time.time() - self.fps_start_time
         if elapsed >= 1.0:
             self.current_fps = self.fps_counter / elapsed
-            
+
             # Add to history (ignore very low FPS from lag/model switch)
             if self.current_fps >= 5.0:
                 self.fps_history.append(self.current_fps)
                 if len(self.fps_history) > self.fps_history_max:
                     self.fps_history.pop(0)
-            
-            # AUTO CLEANUP if FPS drops significantly
+
+            # AUTO CLEANUP if FPS drops significantly (with cooldown)
             if len(self.fps_history) >= 5:
                 avg_fps = sum(self.fps_history) / len(self.fps_history)
-                if self.current_fps < avg_fps * 0.7:  # FPS dropped 30%
-                    print(f"⚠️ FPS drop detected ({self.current_fps:.1f} < {avg_fps:.1f}), auto-cleaning...")
-                    QTimer.singleShot(0, self.manual_cleanup)
-            
-            # Calculate average FPS
+                if self.current_fps < avg_fps * 0.7:
+                    since_last_cleanup = time.time() - self.last_auto_cleanup_time
+                    if since_last_cleanup >= self.auto_cleanup_cooldown:
+                        self.last_auto_cleanup_time = time.time()
+                        QTimer.singleShot(0, self.manual_cleanup)
+
             if len(self.fps_history) > 0:
                 avg_fps = sum(self.fps_history) / len(self.fps_history)
                 self.fps_label.setText(f"FPS: {self.current_fps:.1f} (avg: {avg_fps:.1f})")
             else:
                 self.fps_label.setText(f"FPS: {self.current_fps:.1f}")
-            
-            # Color based on performance
+
             if self.current_fps >= 20:
                 color = '#4ade80'
             elif self.current_fps >= 10:
                 color = '#fbbf24'
             else:
                 color = '#ef4444'
-            self.fps_label.setStyleSheet(f"color: {color}; padding: 5px; font-weight: bold;")
-            
+            if color != self.last_fps_color:
+                self.fps_label.setStyleSheet(f"color: {color}; padding: 5px; font-weight: bold;")
+                self.last_fps_color = color
+
             self.fps_counter = 0
             self.fps_start_time = time.time()
-            
+
             # Update stats only once per second
             if stats['total_objects'] > 0:
                 stats_text = f"Total Objects: {stats['total_objects']}\n\n"
                 stats_text += "Detections:\n"
                 for cls_name, count in stats['class_counts'].items():
                     stats_text += f"  {cls_name}: {count}\n"
-                self.stats_text.setText(stats_text)
-        
+            else:
+                stats_text = "No active detections.\n\nTips:\n- Use Ultra mode for livestreams\n- Lower resize to 75% or 50%\n- Keep tracker on Simple or SORT for higher FPS"
+
+            if stats_text != self.last_stats_text:
+                self.stats_text.setPlainText(stats_text)
+                self.last_stats_text = stats_text
+
+            if (now - self.last_runtime_refresh_time) >= self.runtime_refresh_interval:
+                self._refresh_runtime_overview()
+                self.last_runtime_refresh_time = now
+
     def closeEvent(self, event):
         """Handle window close"""
         # Save settings before closing
@@ -1628,7 +2267,7 @@ class MainWindow(QMainWindow):
         settings = {
             # Model settings
             'model_choice': self.model_combo.currentText(),
-            'best_model_choice': self.best_model_combo.currentText(),
+            'custom_model_path': self.custom_model_path,
             'tracker_choice': self.tracker_combo.currentText(),
             
             # Detection settings
@@ -1638,6 +2277,7 @@ class MainWindow(QMainWindow):
             'frame_skip': self.frame_skip_slider.value(),
             'resize_scale': self.resize_combo.currentText(),
             'smooth_mode': self.smooth_mode,
+            'processing_mode': self._get_processing_mode(),
             
             # Stream settings
             'stream_quality': self.stream_quality_combo.currentText(),
@@ -1671,20 +2311,57 @@ class MainWindow(QMainWindow):
                 settings = json.load(f)
             
             # Model settings
+            saved_model_choice = settings.get('model_choice')
+            model_choice_loaded = False
             if 'model_choice' in settings:
                 index = self.model_combo.findText(settings['model_choice'])
                 if index >= 0:
                     self.model_combo.setCurrentIndex(index)
-            
-            if 'best_model_choice' in settings:
-                index = self.best_model_combo.findText(settings['best_model_choice'])
-                if index >= 0:
-                    self.best_model_combo.setCurrentIndex(index)
+                    model_choice_loaded = True
+                elif 'YOLOv26n' in settings['model_choice']:
+                    index = self.model_combo.findText("YOLOv26n (GPU Recommended)")
+                    if index >= 0:
+                        self.model_combo.setCurrentIndex(index)
+                        model_choice_loaded = True
+                elif 'YOLOv11s' in settings['model_choice']:
+                    index = self.model_combo.findText("YOLOv11s (Fast)")
+                    if index >= 0:
+                        self.model_combo.setCurrentIndex(index)
+                        model_choice_loaded = True
+            if 'custom_model_path' in settings:
+                self.custom_model_path = settings['custom_model_path']
+            elif 'best_model_choice' in settings and (
+                not model_choice_loaded or saved_model_choice == "Custom model..."
+            ):
+                saved_best_model = settings['best_model_choice']
+                if isinstance(saved_best_model, str) and saved_best_model.startswith("Custom: "):
+                    self.custom_model_path = saved_best_model.replace("Custom: ", "").strip()
+                    index = self.model_combo.findText("Custom model...")
+                    if index >= 0:
+                        self.model_combo.blockSignals(True)
+                        self.model_combo.setCurrentIndex(index)
+                        self.model_combo.blockSignals(False)
+                elif 'Train2' in str(saved_best_model):
+                    index = self.model_combo.findText("Train2 (Multi-class)")
+                    if index >= 0:
+                        self.model_combo.setCurrentIndex(index)
+                elif 'Train1' in str(saved_best_model):
+                    index = self.model_combo.findText("Train1 (Person model)")
+                    if index >= 0:
+                        self.model_combo.setCurrentIndex(index)
             
             if 'tracker_choice' in settings:
                 index = self.tracker_combo.findText(settings['tracker_choice'])
                 if index >= 0:
                     self.tracker_combo.setCurrentIndex(index)
+                elif 'SORT' in settings['tracker_choice']:
+                    sort_index = self.tracker_combo.findText("SORT (Fast)")
+                    if sort_index >= 0:
+                        self.tracker_combo.setCurrentIndex(sort_index)
+                elif 'DeepSort' in settings['tracker_choice']:
+                    deep_index = self.tracker_combo.findText("DeepSORT (Stable)")
+                    if deep_index >= 0:
+                        self.tracker_combo.setCurrentIndex(deep_index)
             
             # Detection settings
             if 'confidence' in settings:
@@ -1701,6 +2378,15 @@ class MainWindow(QMainWindow):
             
             if 'smooth_mode' in settings:
                 self.smooth_mode = settings['smooth_mode']
+                if hasattr(self, 'btn_smooth_toggle'):
+                    self.btn_smooth_toggle.blockSignals(True)
+                    self.btn_smooth_toggle.setChecked(self.smooth_mode)
+                    self.btn_smooth_toggle.blockSignals(False)
+                    self.toggle_smooth_mode(self.smooth_mode, self.btn_smooth_toggle)
+
+            # Mutually-exclusive processing mode
+            saved_mode = settings.get('processing_mode', 'standard')
+            self._apply_processing_mode(saved_mode, trigger_reload=False)
             
             # Stream settings
             if 'stream_quality' in settings:
@@ -1725,6 +2411,7 @@ class MainWindow(QMainWindow):
                     self.btn_toggle_roi.setChecked(True)
                     self.btn_toggle_roi.setText("👁️ Show")
             
+            self._refresh_custom_model_input()
             print("✅ Settings loaded")
             
         except Exception as e:
@@ -1772,8 +2459,45 @@ class MainWindow(QMainWindow):
             print(f"Error saving stream history: {e}")
 
 
+def _ensure_python310_runtime() -> bool:
+    """
+    Relaunch with Python 3.10 when the user starts the app via `py pyqt_app.py`
+    and the launcher resolves to another interpreter such as Python 3.13.
+    """
+    if sys.version_info[:2] == (3, 10):
+        return True
+
+    if os.environ.get("PYQT_APP_PY310_RELAUNCHED") == "1":
+        return True
+
+    launcher = shutil.which("py")
+    if not launcher:
+        print(
+            f"[WARN] Running on Python {sys.version_info.major}.{sys.version_info.minor}. "
+            "GPU runtime is validated on Python 3.10."
+        )
+        return True
+
+    env = dict(os.environ)
+    env["PYQT_APP_PY310_RELAUNCHED"] = "1"
+    try:
+        subprocess.Popen(
+            [launcher, "-3.10", str(Path(__file__).resolve())],
+            cwd=str(Path(__file__).resolve().parent),
+            env=env,
+        )
+        print("Re-launching with Python 3.10 for the CUDA-enabled runtime...")
+        return False
+    except Exception as exc:
+        print(f"[WARN] Could not relaunch with Python 3.10: {exc}")
+        return True
+
+
 def main():
     """Main entry point"""
+    if not _ensure_python310_runtime():
+        return
+
     app = QApplication(sys.argv)
     
     # Set dark theme
