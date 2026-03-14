@@ -520,7 +520,7 @@ class VideoProcessor:
             cv2.circle(frame, (center_x, center_y), 6, (255, 255, 255), 1)
             
             # Vẽ label bên cạnh điểm
-            label_lines = [class_name, f"v{track_id}_{int(ltrb[0])}"]
+            label_lines = [class_name, f"ID:{track_id}"]
             
             # Font scale từ slider
             font_scale = self.font_size / 30.0

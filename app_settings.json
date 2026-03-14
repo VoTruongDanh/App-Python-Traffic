@@ -4,24 +4,49 @@
   "tracker_choice": "DeepSORT (Stable)",
   "confidence": 25,
   "box_thickness": 2,
-  "font_size": 20,
+  "font_size": 12,
   "font_thickness": 2,
   "display_point_mode": true,
   "trail_enabled": false,
-  "max_det": 84,
+  "max_det": 99,
   "tracker_age": 30,
   "frame_skip": 0,
-  "resize_scale": "25% (Ultra Fast)",
+  "resize_scale": "100% (Full Quality)",
   "smooth_mode": true,
-  "processing_mode": "ultra",
+  "processing_mode": "threaded",
   "adaptive_fps": false,
-  "stream_input": "https://www.youtube.com/watch?v=G_G8A6JU_LI",
+  "stream_input": "https://www.youtube.com/watch?v=1EiC9bvVGnk",
   "stream_quality": "720p (Balanced) \u2b50",
-  "video_type": "\ud83c\udfa5 Regular Video (Stream)",
+  "video_type": "\ud83d\udd34 Livestream",
   "last_video_file_path": null,
-  "roi_threshold": 69,
+  "roi_threshold": 50,
   "roi_visible": true,
-  "roi_config": null,
-  "sidebar_visible": true,
+  "roi_config": {
+    "points": [
+      [
+        16,
+        260
+      ],
+      [
+        643,
+        128
+      ],
+      [
+        1224,
+        191
+      ],
+      [
+        1026,
+        668
+      ],
+      [
+        31,
+        669
+      ]
+    ],
+    "threshold": 0.5,
+    "active": true
+  },
+  "sidebar_visible": false,
   "runtime_expanded": false
 }
