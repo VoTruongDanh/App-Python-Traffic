@@ -1,4 +1,4 @@
-"""
+﻿"""
 Model loading utilities với caching
 Supports both PyTorch (.pt) and ONNX (.onnx) models
 ONNX models provide 2-3x speedup with same quality
@@ -31,13 +31,13 @@ try:
 except Exception:
     st = None
 from deep_sort_realtime.deepsort_tracker import DeepSort
-import config
+from src.core import config
 import torch
 
 # Try to import ONNX support
 try:
     import onnxruntime as ort
-    from onnx_model import ONNXModel
+    from src.inference.onnx_model import ONNXModel
     ONNX_AVAILABLE = True
 except ImportError:
     ONNX_AVAILABLE = False
@@ -328,7 +328,7 @@ def initialize_tracker(tracker_type='SORT (Fast)'):
 
     if 'simple' in tracker_name:
         try:
-            from simple_tracker import SimpleTracker
+            from src.tracking.simple_tracker import SimpleTracker
             print("✅ Using Simple tracker")
             return SimpleTracker(
                 max_age=config.TRACKER_MAX_AGE,
@@ -340,7 +340,7 @@ def initialize_tracker(tracker_type='SORT (Fast)'):
 
     if tracker_name.startswith('sort'):
         try:
-            from sort_tracker import SORTTracker
+            from src.tracking.sort_tracker import SORTTracker
             print("✅ Using SORT tracker")
             return SORTTracker(
                 max_age=config.TRACKER_MAX_AGE,
@@ -360,7 +360,7 @@ def initialize_tracker(tracker_type='SORT (Fast)'):
     # DeepSort on CPU is usually too slow for real-time. Auto fallback to fast tracker.
     if not use_gpu:
         try:
-            from sort_tracker import SORTTracker
+            from src.tracking.sort_tracker import SORTTracker
             print("DeepSort on CPU -> fallback to SORT for FPS")
             return SORTTracker(
                 max_age=config.TRACKER_MAX_AGE,
@@ -369,7 +369,7 @@ def initialize_tracker(tracker_type='SORT (Fast)'):
             )
         except ImportError:
             try:
-                from simple_tracker import SimpleTracker
+                from src.tracking.simple_tracker import SimpleTracker
                 print("DeepSort on CPU -> fallback to Simple tracker for FPS")
                 return SimpleTracker(
                     max_age=config.TRACKER_MAX_AGE,

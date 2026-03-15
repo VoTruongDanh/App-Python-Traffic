@@ -1,12 +1,12 @@
-"""
+﻿"""
 Test Person Classification Integration
 Quick test to verify person classification is working
 """
 import cv2
 import numpy as np
-from model_loader import load_yolo_models, initialize_tracker
-from video_processor import VideoProcessor
-import config
+from src.inference.model_loader import load_yolo_models, initialize_tracker
+from src.processing.video_processor import VideoProcessor
+from src.core import config
 
 def test_person_classification():
     """Test person classification with a sample video"""

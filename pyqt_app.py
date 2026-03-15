@@ -1,9 +1,9 @@
-"""
+﻿"""
 PyQt5 Desktop App - Real-time Object Tracking
 High-performance alternative to Streamlit for local use
 """
-import config
-from model_loader import load_yolo_models, initialize_tracker
+from src.core import config
+from src.inference.model_loader import load_yolo_models, initialize_tracker
 
 import os
 import shutil
@@ -21,9 +21,9 @@ from PyQt5.QtGui import QImage, QPixmap, QFont
 import time
 from pathlib import Path
 
-from video_processor import VideoProcessor
-# from video_processor_optimized import VideoProcessorOptimized as VideoProcessor
-from roi_manager import ROIManager
+from src.processing.video_processor import VideoProcessor
+# from src.processing.video_processor_optimized import VideoProcessorOptimized as VideoProcessor
+from src.tracking.roi_manager import ROIManager
 
 # Global state for model selection (replacement for st.session_state)
 class AppState:
@@ -1412,19 +1412,19 @@ class MainWindow(QMainWindow):
             
             # Create processor (ultra, optimized, threaded, or standard)
             if selected_mode == "ultra":
-                from video_processor_ultra import UltraVideoProcessor
+                from src.processing.video_processor_ultra import UltraVideoProcessor
                 self.processor = UltraVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
                 print("Using Ultra Processor")
             elif selected_mode == "optimized":
-                from video_processor_optimized import VideoProcessorOptimized
+                from src.processing.video_processor_optimized import VideoProcessorOptimized
                 self.processor = VideoProcessorOptimized(self.model_person, self.model_vehicle, self.tracker)
                 print("Using Optimized Processor")
             elif selected_mode == "threaded":
-                from video_processor_threaded import ThreadedVideoProcessor
+                from src.processing.video_processor_threaded import ThreadedVideoProcessor
                 self.processor = ThreadedVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
                 print("Using Threaded Processor")
             elif cpu_only_mode:
-                from video_processor_ultra import UltraVideoProcessor
+                from src.processing.video_processor_ultra import UltraVideoProcessor
                 self.processor = UltraVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
                 print("Using Ultra Processor (CPU fallback)")
             else:
@@ -1711,7 +1711,7 @@ class MainWindow(QMainWindow):
             return "Not loaded"
 
         try:
-            from onnx_model import ONNXModel
+            from src.inference.onnx_model import ONNXModel
             if isinstance(model, ONNXModel):
                 providers = model.session.get_providers()
                 if providers and providers[0] == 'CUDAExecutionProvider':
@@ -1787,7 +1787,7 @@ class MainWindow(QMainWindow):
             onnx_available = False
             onnx_cuda = False
             try:
-                from onnx_model import ONNXModel
+                from src.inference.onnx_model import ONNXModel
                 import onnxruntime
                 onnx_available = True
                 using_onnx = isinstance(self.model_person, ONNXModel) or isinstance(self.model_vehicle, ONNXModel)
@@ -1942,7 +1942,7 @@ class MainWindow(QMainWindow):
     
     def toggle_trail(self, checked):
         """Toggle trail drawing"""
-        import config
+        from src.core import config
         if checked:
             config.TRAIL_LENGTH = 3  # Enable trail
             self.btn_trail_toggle.setText("🟢 Trail: ON")
@@ -2013,7 +2013,7 @@ class MainWindow(QMainWindow):
         self.tracker_max_age = value
         self.tracker_age_label.setText(f"{value} frames")
         # Update config
-        import config
+        from src.core import config
         config.TRACKER_MAX_AGE = value
         # Update tracker if exists
         if self.tracker:

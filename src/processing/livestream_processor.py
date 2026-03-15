@@ -1,11 +1,11 @@
-"""
+﻿"""
 Livestream processing module - Real-time detection from streams
 """
 import cv2
 import streamlit as st
 import numpy as np
-from video_processor import VideoProcessor
-import config
+from src.processing.video_processor import VideoProcessor
+from src.core import config
 import time
 
 
@@ -61,7 +61,7 @@ def process_livestream(stream_url, stream_type, confidence, frame_skip, resize_s
     """
     Xử lý livestream real-time (Optimized v2)
     """
-    from model_loader import load_yolo_models, initialize_tracker
+    from src.inference.model_loader import load_yolo_models, initialize_tracker
     
     st.toast("🔄 Đang kết nối...", icon="🔄")
     

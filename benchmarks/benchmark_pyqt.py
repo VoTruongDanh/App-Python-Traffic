@@ -4,8 +4,8 @@ Benchmark script to compare PyQt5 vs Streamlit performance
 import cv2
 import time
 import numpy as np
-from model_loader import load_yolo_models, initialize_tracker
-from video_processor import VideoProcessor
+from src.inference.model_loader import load_yolo_models, initialize_tracker
+from src.processing.video_processor import VideoProcessor
 
 
 def benchmark_processing(video_source, duration_seconds=10, frame_skip=2, resize_scale=50):

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Ultra-Optimized Video Processor for 40+ FPS
 Key optimizations:
 1. BATCH TENSOR TRANSFER - single .cpu().numpy() call per inference
@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 from typing import Tuple, Dict, Optional
 from contextlib import nullcontext
-import config
+from src.core import config
 
 # Try to import torch for FP16 support
 try:

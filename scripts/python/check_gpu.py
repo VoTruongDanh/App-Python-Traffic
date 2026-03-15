@@ -1,9 +1,9 @@
-"""
+﻿"""
 Quick script to check GPU usage
 """
 import torch
 from ultralytics import YOLO
-import config
+from src.core import config
 
 print("=" * 50)
 print("GPU CHECK")

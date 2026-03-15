@@ -1,11 +1,11 @@
-"""
+﻿"""
 FPS Benchmark - Test real inference speed without UI overhead
 """
 import cv2
 import time
 import numpy as np
-from model_loader import load_yolo_models, initialize_tracker
-from video_processor import VideoProcessor
+from src.inference.model_loader import load_yolo_models, initialize_tracker
+from src.processing.video_processor import VideoProcessor
 
 def benchmark_fps(video_path, duration=30):
     """

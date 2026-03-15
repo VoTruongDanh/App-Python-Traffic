@@ -1,4 +1,4 @@
-"""
+﻿"""
 Utility functions cho Video Processing Application
 """
 import os
@@ -8,7 +8,7 @@ import tempfile
 from typing import Optional, Dict
 import requests
 import streamlit as st
-import config
+from src.core import config
 
 
 def create_directories():

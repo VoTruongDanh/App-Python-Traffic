@@ -28,7 +28,8 @@ from PyQt5.QtWidgets import (
 )
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parents[1]
 
 
 def _probe_python(python_exe: str):
@@ -117,10 +118,11 @@ class ConvertThread(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, model_path: str, python_exe: str):
+    def __init__(self, model_path: str, python_exe: str, script_dir: Path):
         super().__init__()
         self.model_path = model_path
         self.python_exe = python_exe
+        self.script_dir = script_dir
 
     def run(self):
         try:
@@ -130,6 +132,7 @@ class ConvertThread(QThread):
 
             convert_code = (
                 "import sys; "
+                f"sys.path.insert(0, r'{str(self.script_dir)}'); "
                 "from convert_models_to_onnx import convert_model_to_onnx; "
                 "ok = convert_model_to_onnx(sys.argv[1]); "
                 "print('__CONVERT_STATUS__=' + ('1' if ok else '0'))"
@@ -442,7 +445,7 @@ class ONNXConverterApp(QMainWindow):
             self.convert_next()
             return
 
-        self.convert_thread = ConvertThread(file_path, self.conversion_python)
+        self.convert_thread = ConvertThread(file_path, self.conversion_python, SCRIPT_DIR)
         self.convert_thread.progress.connect(self.log)
         self.convert_thread.finished.connect(self.on_convert_finished)
         self.convert_thread.start()

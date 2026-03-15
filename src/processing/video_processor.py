@@ -1,4 +1,4 @@
-"""
+﻿"""
 Video Processor - Core logic xử lý video với YOLOv3 + DeepSort
 """
 import cv2
@@ -6,8 +6,8 @@ import numpy as np
 from typing import Tuple, Dict, Set, List
 from contextlib import nullcontext
 from PIL import Image, ImageDraw, ImageFont
-import config
-from person_classifier import PersonClassifier
+from src.core import config
+from src.inference.person_classifier import PersonClassifier
 
 try:
     import torch

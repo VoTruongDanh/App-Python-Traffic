@@ -1,11 +1,11 @@
-"""
+﻿"""
 Simple test script for ROI functionality
 Run this to verify ROI feature is working correctly
 """
 import sys
 import numpy as np
 import cv2
-from roi_manager import ROIManager
+from src.tracking.roi_manager import ROIManager
 
 
 def test_roi_basic():

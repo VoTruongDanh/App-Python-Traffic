@@ -1,4 +1,4 @@
-# """
+﻿# """
 # 🎥 Ứng dụng Xử lý Video với YOLOv3 + DeepSort
 # Phát hiện và theo dõi Người & Xe trong video
 # """
@@ -10,11 +10,11 @@
 # from pathlib import Path
 
 # # Import modules
-# import config
-# import utils
-# from model_loader import load_yolo_models, initialize_tracker, display_model_info
-# from video_processor import VideoProcessor
-# from livestream_processor import process_livestream
+# from src.core import config
+# from src.core import utils
+# from src.inference.model_loader import load_yolo_models, initialize_tracker, display_model_info
+# from src.processing.video_processor import VideoProcessor
+# from src.processing.livestream_processor import process_livestream
 
 
 # # =============================================================================

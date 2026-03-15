@@ -1,6 +1,11 @@
 @echo off
 REM Batch script to run PyQt5 Desktop App on Windows
 
+setlocal
+set "SCRIPT_DIR=%~dp0"
+set "PROJECT_ROOT=%SCRIPT_DIR%..\.."
+cd /d "%PROJECT_ROOT%"
+
 echo ========================================
 echo   Real-time Object Tracking - PyQt5
 echo ========================================
@@ -67,7 +72,7 @@ if not errorlevel 1 (
     %VENV_PYTHON% -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" >nul 2>nul
     if errorlevel 1 (
         echo [WARN] NVIDIA GPU detected but torch CUDA is NOT active in this venv.
-        echo [INFO] Run setup_gpu_windows.bat once to install CUDA-enabled runtime.
+        echo [INFO] Run scripts\windows\setup_gpu_windows.bat once to install CUDA-enabled runtime.
         echo.
     )
 )

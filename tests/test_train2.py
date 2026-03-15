@@ -1,4 +1,4 @@
-"""
+﻿"""
 Test script for Train2 model integration
 """
 import os
@@ -29,7 +29,7 @@ def test_config():
     print("=" * 50)
     
     try:
-        import config
+        from src.core import config
         
         # Check Train2 path
         if hasattr(config, 'MODEL_TRAIN2_PATH'):
@@ -98,7 +98,7 @@ def test_video_processor():
     print("=" * 50)
     
     try:
-        from video_processor import VideoProcessor
+        from src.processing.video_processor import VideoProcessor
         
         # Check methods exist
         methods = ['_is_train2_model', '_get_class_name']

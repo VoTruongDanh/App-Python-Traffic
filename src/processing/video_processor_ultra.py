@@ -1,4 +1,4 @@
-"""
+﻿"""
 Ultra Video Processor - Async Double-Buffer Pipeline for 50+ FPS
 Designed for smooth video streaming without frame skipping
 
@@ -16,7 +16,7 @@ from collections import deque
 import threading
 import time
 from contextlib import nullcontext
-import config
+from src.core import config
 
 # Try to import torch for CUDA support
 try:

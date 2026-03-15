@@ -1,4 +1,4 @@
-"""
+﻿"""
 Threaded Video Processor - Parallel inference and drawing
 Tách inference (GPU) và drawing (CPU) ra 2 threads để tăng FPS
 """
@@ -7,7 +7,7 @@ import numpy as np
 from typing import Tuple, Dict
 import threading
 import queue
-from video_processor import VideoProcessor
+from src.processing.video_processor import VideoProcessor
 
 
 class ThreadedVideoProcessor(VideoProcessor):
@@ -126,7 +126,7 @@ class ThreadedVideoProcessor(VideoProcessor):
                 detections = self._extract_detections_batch(results, scale_factor)
             else:
                 # Dual model
-                import config
+                from src.core import config
                 max_det_person = max(5, max_det // 2)
                 max_det_vehicle = max(5, max_det // 2)
 

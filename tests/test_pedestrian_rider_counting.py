@@ -1,4 +1,4 @@
-"""
+﻿"""
 Test Pedestrian vs Rider Counting
 Kiểm tra xem hệ thống có đếm đúng khi người chuyển từ pedestrian sang rider không
 """
@@ -9,10 +9,10 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent))
 
-from model_loader import ModelLoader
-from sort_tracker import SORTTracker
-from video_processor import VideoProcessor
-import config
+from src.inference.model_loader import ModelLoader
+from src.tracking.sort_tracker import SORTTracker
+from src.processing.video_processor import VideoProcessor
+from src.core import config
 
 
 def test_pedestrian_rider_counting():

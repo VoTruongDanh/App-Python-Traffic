@@ -27,6 +27,8 @@ dist/
 .idea/
 *.swp
 *.swo
+.cursor/
+agent/
 
 # OS files
 .DS_Store

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Test ONNX integration - verify everything works
 """
 import os
@@ -25,14 +25,14 @@ def test_imports():
         return False
     
     try:
-        from onnx_model import ONNXModel
+        from src.inference.onnx_model import ONNXModel
         print("✅ onnx_model imported")
     except ImportError as e:
         print(f"❌ onnx_model import failed: {e}")
         return False
     
     try:
-        from model_loader import load_yolo_models, _load_model
+        from src.inference.model_loader import load_yolo_models, _load_model
         print("✅ model_loader imported")
     except ImportError as e:
         print(f"❌ model_loader import failed: {e}")
@@ -94,7 +94,7 @@ def test_model_loading():
     print("=" * 60)
     
     try:
-        from model_loader import _load_model
+        from src.inference.model_loader import _load_model
         import torch
         
         # Test loading a model
@@ -110,7 +110,7 @@ def test_model_loading():
                 model = _load_model(model_path, use_gpu=torch.cuda.is_available())
                 
                 # Check if ONNX
-                from onnx_model import ONNXModel
+                from src.inference.onnx_model import ONNXModel
                 if isinstance(model, ONNXModel):
                     print(f"   ✅ Loaded as ONNX")
                 else:
@@ -137,7 +137,7 @@ def test_inference():
     
     try:
         import numpy as np
-        from model_loader import _load_model
+        from src.inference.model_loader import _load_model
         import torch
         
         # Find a model to test

@@ -1,6 +1,8 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+set "SCRIPT_DIR=%~dp0"
+set "PROJECT_ROOT=%SCRIPT_DIR%..\.."
+cd /d "%PROJECT_ROOT%"
 
 echo ========================================
 echo   GPU Setup for PyQt Object Tracking

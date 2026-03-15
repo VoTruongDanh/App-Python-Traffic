@@ -4,7 +4,7 @@ Benchmark model inference speed to find bottleneck
 import time
 import cv2
 import numpy as np
-from model_loader import load_yolo_models
+from src.inference.model_loader import load_yolo_models
 
 def benchmark_model():
     print("=" * 60)
@@ -19,7 +19,7 @@ def benchmark_model():
     print(f"   Load time: {load_time:.2f}s")
     
     # Check model type
-    from onnx_model import ONNXModel
+    from src.inference.onnx_model import ONNXModel
     is_onnx = isinstance(model_person, ONNXModel) or isinstance(model_vehicle, ONNXModel)
     print(f"   Model type: {'ONNX' if is_onnx else 'PyTorch'}")
     

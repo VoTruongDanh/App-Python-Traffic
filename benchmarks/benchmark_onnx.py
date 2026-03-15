@@ -9,7 +9,7 @@ from ultralytics import YOLO
 import os
 
 try:
-    from onnx_model import ONNXModel
+    from src.inference.onnx_model import ONNXModel
     ONNX_AVAILABLE = True
 except ImportError:
     ONNX_AVAILABLE = False

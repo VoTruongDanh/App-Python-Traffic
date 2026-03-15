@@ -18,7 +18,7 @@
 - GPU NVIDIA (Khuyến kích) để có FPS cao nhất.
 
 ### Cách chạy nhanh
-Double-click vào file `RUN_PYQT_APP.bat`. Script sẽ tự động:
+Double-click vào file `scripts/windows/RUN_PYQT_APP.bat`. Script sẽ tự động:
 1. Tạo môi trường ảo (venv)
 2. Cài đặt thư viện cần thiết (`requirements_pyqt.txt`)
 3. Khởi động ứng dụng
@@ -56,10 +56,25 @@ python pyqt_app.py
   - Bật **Optimized Mode**.
   - Giảm "Resize Scale" xuống 75% hoặc 50%.
   - Tăng "Frame Skip" lên 1-2.
-- **Lỗi CUDA**: Chạy `python cuda_fix.py` để kiểm tra môi trường torch/cuda.
+- **Lỗi CUDA**: Chạy `python scripts/python/cuda_fix.py` để kiểm tra môi trường torch/cuda.
 
 ## 📁 Cấu trúc thư mục
-- `pyqt_app.py`: File chính.
-- `video_processor_optimized.py`: Module xử lý tối ưu.
-- `model_loader.py`: Quản lý load model.
-- `config.py`: Cấu hình hệ thống.
+
+```
+UI/
+├── pyqt_app.py           # Entry point ứng dụng Desktop
+├── app.py                # Entry point ứng dụng Streamlit
+├── src/                  # Code nghiệp vụ
+│   ├── core/             # config.py, utils.py
+│   ├── inference/        # model_loader, onnx_model, person_classifier
+│   ├── processing/       # video_processor*, livestream_processor
+│   └── tracking/         # roi_manager, trackers, fps_booster
+├── tests/                # Script kiểm thử
+├── benchmarks/           # Script đo hiệu năng
+├── scripts/
+│   ├── python/           # Công cụ hỗ trợ (GPU, ONNX, CUDA)
+│   └── windows/          # Launcher .bat cho Windows
+├── model/                # Trọng số model
+├── docs/                 # Tài liệu chi tiết
+└── docs/PROJECT_STRUCTURE.md  # Hướng dẫn cấu trúc
+```

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Test FPS Booster
 So sánh FPS với và không có FPS Booster
 """
@@ -9,11 +9,11 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent))
 
-from model_loader import ModelLoader
-from sort_tracker import SORTTracker
-from video_processor import VideoProcessor
-from fps_booster import FPSBooster
-import config
+from src.inference.model_loader import ModelLoader
+from src.tracking.sort_tracker import SORTTracker
+from src.processing.video_processor import VideoProcessor
+from src.tracking.fps_booster import FPSBooster
+from src.core import config
 
 
 def test_without_booster(video_path, duration=30):
