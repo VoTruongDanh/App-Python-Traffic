@@ -29,6 +29,7 @@ dist/
 *.swo
 .cursor/
 agent/
+.codex/
 
 # OS files
 .DS_Store
