@@ -9,16 +9,21 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import cv2
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QSlider, QComboBox,
                              QFileDialog, QLineEdit, QGroupBox, QGridLayout, QTextEdit,
                              QDialog, QProgressBar, QListWidget, QListWidgetItem, QToolButton,
-                             QScrollArea, QFrame, QSizePolicy)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QFont
+                             QScrollArea, QFrame, QSizePolicy, QOpenGLWidget)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect
+from PyQt5.QtGui import (
+    QImage, QPixmap, QFont, QPainter, QColor,
+    QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture
+)
 import time
+import ctypes
 from pathlib import Path
 
 from src.processing.video_processor import VideoProcessor
@@ -35,9 +40,382 @@ class AppState:
 app_state = AppState()
 
 
+class SharedFrameStore:
+    """Thread-safe holder for the newest processed frame and metadata."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._frame = None
+        self._stats = {'total_objects': 0, 'class_counts': {}}
+        self._version = 0
+
+    def publish(self, frame, stats):
+        with self._lock:
+            self._frame = frame
+            self._stats = stats
+            self._version += 1
+            return self._version
+
+    def read(self):
+        with self._lock:
+            return self._version, self._frame, self._stats
+
+    def clear(self):
+        with self._lock:
+            self._frame = None
+            self._stats = {'total_objects': 0, 'class_counts': {}}
+            self._version = 0
+
+
+class VideoOpenGLWidget(QOpenGLWidget):
+    """Render frames with OpenGL shader; fallback to painter if GL path fails."""
+
+    _GL_TRIANGLE_STRIP = 0x0005
+    _GL_COLOR_BUFFER_BIT = 0x00004000
+
+    def __init__(self):
+        super().__init__()
+        self._frame = None
+        self._message = "Load video or livestream to begin"
+        self._shader_program = None
+        self._texture = None
+        self._texture_size = (0, 0)
+        self._gl_ready = False
+        self._gl_failed = False
+        self._vertices = np.array(
+            [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0],
+            dtype=np.float32
+        )
+        self._tex_coords = np.array(
+            [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0],
+            dtype=np.float32
+        )
+        self._display_rect = QRect()
+
+    def setText(self, text):
+        self._message = text or ""
+        self.update()
+
+    def clear_frame(self):
+        self._frame = None
+        self.update()
+
+    def has_frame(self):
+        return self._frame is not None
+
+    def content_rect(self, frame_size=None):
+        if frame_size is None and self._frame is not None:
+            frame_size = (self._frame.shape[1], self._frame.shape[0])
+        if not frame_size:
+            return QRect(0, 0, self.width(), self.height())
+
+        frame_w, frame_h = frame_size
+        if frame_w <= 0 or frame_h <= 0 or self.width() <= 0 or self.height() <= 0:
+            return QRect(0, 0, self.width(), self.height())
+
+        scale = min(self.width() / frame_w, self.height() / frame_h)
+        draw_w = int(frame_w * scale)
+        draw_h = int(frame_h * scale)
+        off_x = (self.width() - draw_w) // 2
+        off_y = (self.height() - draw_h) // 2
+        return QRect(off_x, off_y, draw_w, draw_h)
+
+    def set_frame(self, frame):
+        self._frame = frame
+        if frame is not None:
+            self._message = ""
+        self.update()
+
+    def initializeGL(self):
+        try:
+            self._init_shader_program()
+            self._gl_ready = True
+        except Exception:
+            self._gl_failed = True
+            self._gl_ready = False
+
+    def _init_shader_program(self):
+        vertex_shader = """
+            attribute vec2 position;
+            attribute vec2 texCoord;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_Position = vec4(position, 0.0, 1.0);
+                vTexCoord = texCoord;
+            }
+        """
+        fragment_shader = """
+            varying vec2 vTexCoord;
+            uniform sampler2D frameTex;
+            void main() {
+                vec4 c = texture2D(frameTex, vTexCoord);
+                gl_FragColor = vec4(c.b, c.g, c.r, 1.0);
+            }
+        """
+
+        program = QOpenGLShaderProgram(self.context())
+        if not program.addShaderFromSourceCode(QOpenGLShader.Vertex, vertex_shader):
+            raise RuntimeError(program.log())
+        if not program.addShaderFromSourceCode(QOpenGLShader.Fragment, fragment_shader):
+            raise RuntimeError(program.log())
+        if not program.link():
+            raise RuntimeError(program.log())
+        self._shader_program = program
+
+    def _ensure_texture(self, width, height):
+        if self._texture and self._texture_size == (width, height):
+            return
+
+        if self._texture is not None:
+            self._texture.destroy()
+            self._texture = None
+
+        texture = QOpenGLTexture(QOpenGLTexture.Target2D)
+        texture.setFormat(QOpenGLTexture.RGB8_UNorm)
+        texture.setSize(width, height)
+        texture.setWrapMode(QOpenGLTexture.ClampToEdge)
+        texture.setMinificationFilter(QOpenGLTexture.Linear)
+        texture.setMagnificationFilter(QOpenGLTexture.Linear)
+        texture.allocateStorage(QOpenGLTexture.RGB, QOpenGLTexture.UInt8)
+        self._texture = texture
+        self._texture_size = (width, height)
+
+    def _upload_texture(self, frame):
+        try:
+            self._texture.setData(QOpenGLTexture.RGB, QOpenGLTexture.UInt8, frame)
+        except TypeError:
+            self._texture.setData(QOpenGLTexture.RGB, QOpenGLTexture.UInt8, frame.data)
+
+    def _draw_with_shader(self, frame):
+        if frame is None:
+            return False
+        if not self._gl_ready or self._gl_failed or self._shader_program is None:
+            return False
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            return False
+
+        if not frame.flags['C_CONTIGUOUS']:
+            frame = np.ascontiguousarray(frame)
+
+        h, w = frame.shape[:2]
+        if h <= 0 or w <= 0:
+            return False
+
+        try:
+            self._ensure_texture(w, h)
+            self._upload_texture(frame)
+            functions = self.context().functions()
+
+            functions.glClearColor(0.03, 0.06, 0.09, 1.0)
+            functions.glClear(self._GL_COLOR_BUFFER_BIT)
+
+            draw_rect = self.content_rect((w, h))
+            self._display_rect = draw_rect
+            viewport_y = max(0, self.height() - draw_rect.y() - draw_rect.height())
+            functions.glViewport(draw_rect.x(), viewport_y, draw_rect.width(), draw_rect.height())
+
+            self._shader_program.bind()
+            self._texture.bind(0)
+            self._shader_program.setUniformValue("frameTex", 0)
+
+            pos_loc = self._shader_program.attributeLocation("position")
+            tex_loc = self._shader_program.attributeLocation("texCoord")
+            self._shader_program.enableAttributeArray(pos_loc)
+            self._shader_program.enableAttributeArray(tex_loc)
+            self._shader_program.setAttributeArray(pos_loc, self._vertices, 2)
+            self._shader_program.setAttributeArray(tex_loc, self._tex_coords, 2)
+
+            functions.glDrawArrays(self._GL_TRIANGLE_STRIP, 0, 4)
+
+            self._shader_program.disableAttributeArray(pos_loc)
+            self._shader_program.disableAttributeArray(tex_loc)
+            self._texture.release()
+            self._shader_program.release()
+
+            functions.glViewport(0, 0, self.width(), self.height())
+            return True
+        except Exception:
+            self._gl_failed = True
+            return False
+
+    def _draw_with_painter(self, frame):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(8, 16, 24))
+        if frame is not None and frame.ndim == 3 and frame.shape[2] == 3:
+            if not frame.flags['C_CONTIGUOUS']:
+                frame = np.ascontiguousarray(frame)
+            h, w, ch = frame.shape
+            bytes_per_line = ch * w
+            image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_BGR888)
+            draw_rect = self.content_rect((w, h))
+            self._display_rect = draw_rect
+            painter.drawImage(draw_rect, image)
+        elif self._message:
+            painter.setPen(QColor(216, 229, 239))
+            painter.setFont(QFont("Segoe UI", 12, QFont.DemiBold))
+            painter.drawText(self.rect(), Qt.AlignCenter, self._message)
+        painter.end()
+
+    def paintGL(self):
+        frame = self._frame
+        rendered = self._draw_with_shader(frame)
+        if not rendered:
+            self._draw_with_painter(frame)
+
+
+class ModelLoadThread(QThread):
+    """Background loader for heavy model + tracker initialization."""
+
+    progress = pyqtSignal(str)
+    loaded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, tracker_choice: str):
+        super().__init__()
+        self.tracker_choice = tracker_choice
+
+    def run(self):
+        try:
+            self.progress.emit("Loading detection models...")
+            model_person, model_vehicle = load_yolo_models()
+            self.progress.emit("Initializing tracker...")
+            tracker = initialize_tracker(self.tracker_choice)
+            self.loaded.emit({
+                'model_person': model_person,
+                'model_vehicle': model_vehicle,
+                'tracker': tracker,
+            })
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class StreamResolveThread(QThread):
+    """Background resolver for YouTube sources to keep UI responsive."""
+
+    progress = pyqtSignal(str)
+    resolved = pyqtSignal(object, str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, stream_url: str, quality_text: str):
+        super().__init__()
+        self.stream_url = stream_url
+        self.quality_text = quality_text
+
+    @staticmethod
+    def _quality_to_profile(quality_text: str):
+        text = (quality_text or "").lower()
+        if "1080" in text:
+            return "1080p", 1080
+        if "720" in text:
+            return "720p", 720
+        if "480" in text:
+            return "480p", 480
+        return "360p", 360
+
+    def run(self):
+        try:
+            import yt_dlp
+            import random
+            import string
+
+            quality_name, height = self._quality_to_profile(self.quality_text)
+            self.progress.emit("🔄 Checking YouTube URL...")
+
+            ydl_opts_check = {
+                'quiet': True,
+                'no_warnings': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
+                info = ydl.extract_info(self.stream_url, download=False)
+                title = info.get('title', 'Unknown')[:30]
+                is_live = info.get('is_live', False)
+
+            if is_live:
+                self.progress.emit(f"🔴 Live: {title}... (Getting URL)")
+                ydl_opts = {
+                    'format': f'best[height<={height}]',
+                    'quiet': True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(self.stream_url, download=False)
+                    resolved_url = info['url']
+                self.resolved.emit(resolved_url, f"✅ 🔴 Live {quality_name}: {title}...")
+                return
+
+            self.progress.emit(f"⏬ Downloading: {title}...")
+            temp_dir = Path("temp")
+            temp_dir.mkdir(exist_ok=True)
+            random_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+            temp_file = temp_dir / f"downloaded_{random_id}.mp4"
+
+            ydl_opts = {
+                'format': f'best[height<={height}][ext=mp4]/best[height<={height}]',
+                'outtmpl': str(temp_file),
+                'quiet': False,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([self.stream_url])
+
+            self.resolved.emit(str(temp_file), f"✅ 🎥 Video {quality_name}: {title}...")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+def _reset_tracker_instance(tracker):
+    """Clear stale tracker state across SORT, SimpleTracker, and DeepSort."""
+    if tracker is None:
+        return
+
+    for attr_name in ("tracks", "trackers"):
+        track_list = getattr(tracker, attr_name, None)
+        if isinstance(track_list, list):
+            track_list.clear()
+
+    if hasattr(tracker, 'frame_count'):
+        tracker.frame_count = 0
+    if hasattr(tracker, 'next_id'):
+        tracker.next_id = 1
+    if hasattr(tracker, '_last_ts'):
+        tracker._last_ts = time.monotonic()
+
+
+def _reset_processor_tracking_state(processor):
+    if processor is None:
+        return
+    _reset_tracker_instance(getattr(processor, 'tracker', None))
+    trails = getattr(processor, 'trails', None)
+    if isinstance(trails, dict):
+        trails.clear()
+    if hasattr(processor, 'last_detections'):
+        processor.last_detections = []
+    if hasattr(processor, 'detection_buffer'):
+        try:
+            processor.detection_buffer.clear()
+        except Exception:
+            pass
+    if hasattr(processor, 'detection_version'):
+        processor.detection_version = 0
+    if hasattr(processor, 'last_consumed_detection_version'):
+        processor.last_consumed_detection_version = -1
+    if hasattr(processor, 'pending_frame'):
+        try:
+            lock = getattr(processor, 'frame_lock', None)
+            if lock is not None:
+                with lock:
+                    processor.pending_frame = None
+                    if hasattr(processor, 'pending_params'):
+                        processor.pending_params = None
+            else:
+                processor.pending_frame = None
+                if hasattr(processor, 'pending_params'):
+                    processor.pending_params = None
+        except Exception:
+            pass
+
+
 class VideoThread(QThread):
     """Thread for processing video/livestream - SIMPLE & STABLE"""
-    frame_ready = pyqtSignal(np.ndarray, dict)
+    frame_ready = pyqtSignal(int)
     finished = pyqtSignal()
     
     def __init__(self):
@@ -55,6 +433,7 @@ class VideoThread(QThread):
         self.max_buffer_size = 1  # Keep only 1 frame (effectively disabled)
         self.frame_buf = None
         self._last_stats = {'total_objects': 0, 'class_counts': {}}
+        self.shared_frame_store = None
         
     def set_source(self, source):
         self.source = source
@@ -67,6 +446,15 @@ class VideoThread(QThread):
         self.resize_scale = resize_scale
         if output_fps_limit is not None:
             self.output_fps_limit = max(5, int(output_fps_limit))
+
+    def set_shared_frame_store(self, shared_frame_store):
+        self.shared_frame_store = shared_frame_store
+
+    def _publish_frame(self, frame, stats):
+        if self.shared_frame_store is None:
+            return
+        version = self.shared_frame_store.publish(frame, stats)
+        self.frame_ready.emit(version)
         
     def stop(self):
         self.running = False
@@ -86,7 +474,6 @@ class VideoThread(QThread):
         # For RTSP, use FFMPEG backend with special flags
         if is_rtsp:
             # Set environment variable for FFMPEG options
-            import os
             os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;udp|fflags;nobuffer|flags;low_delay'
             cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
             # Ultra-low latency settings
@@ -112,6 +499,15 @@ class VideoThread(QThread):
         last_success_time = time.time()
         consecutive_failures = 0
         source_frame_index = 0
+        winmm = None
+        highres_timer_enabled = False
+        if os.name == "nt":
+            try:
+                winmm = ctypes.WinDLL("winmm")
+                highres_timer_enabled = (winmm.timeBeginPeriod(1) == 0)
+            except Exception:
+                winmm = None
+                highres_timer_enabled = False
         
         # FRAME PACING: keep output on a fixed cadence to avoid bursty playback.
         source_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -143,7 +539,12 @@ class VideoThread(QThread):
 
             sleep_time = next_emit_deadline - now
             if sleep_time > 0:
-                time.sleep(sleep_time)
+                # Sleep most of the budget, then spin/yield for sub-ms precision.
+                coarse_sleep = sleep_time - 0.002
+                if coarse_sleep > 0:
+                    time.sleep(coarse_sleep)
+                while time.perf_counter() < next_emit_deadline:
+                    time.sleep(0)
 
         def sync_file_source_to_clock():
             """
@@ -200,6 +601,9 @@ class VideoThread(QThread):
                 if not ret:
                     consecutive_failures += 1
                     time_since_last = time.time() - last_success_time
+
+                    if (is_rtsp or is_livestream) and consecutive_failures == 1:
+                        _reset_processor_tracking_state(self.processor)
                     
                     # For RTSP, reconnect faster
                     if is_rtsp and consecutive_failures > 10 and time_since_last > 0.5:
@@ -210,7 +614,6 @@ class VideoThread(QThread):
                         else:
                             cap.release()
                         time.sleep(0.5)
-                        import os
                         os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;udp|fflags;nobuffer|flags;low_delay'
                         cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
                         cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
@@ -220,25 +623,13 @@ class VideoThread(QThread):
                         consecutive_failures = 0
                         
                         # Reset tracker immediately on reconnect
-                        if self.processor and self.processor.tracker:
-                            if hasattr(self.processor.tracker, 'tracks'):
-                                self.processor.tracker.tracks.clear()
-                            if hasattr(self.processor.tracker, 'frame_count'):
-                                self.processor.tracker.frame_count = 0
-                            if hasattr(self.processor, 'trails'):
-                                self.processor.trails.clear()
+                        _reset_processor_tracking_state(self.processor)
                         continue
                     
                     # Reset tracker faster - after 1 second of lag (not 5)
                     if time_since_last > 1.0 and consecutive_failures > 10:
                         print(f"⚠️ Lag detected ({time_since_last:.1f}s), resetting tracker...")
-                        if self.processor and self.processor.tracker:
-                            if hasattr(self.processor.tracker, 'tracks'):
-                                self.processor.tracker.tracks.clear()
-                            if hasattr(self.processor.tracker, 'frame_count'):
-                                self.processor.tracker.frame_count = 0
-                            if hasattr(self.processor, 'trails'):
-                                self.processor.trails.clear()
+                        _reset_processor_tracking_state(self.processor)
                         last_success_time = time.time()
                         consecutive_failures = 0
                     
@@ -261,10 +652,9 @@ class VideoThread(QThread):
                     if skip_counter != 0:
                         use_tracking_only = supports_tracking_only
                         if not use_tracking_only:
-                            if self.smooth_mode and last_processed_frame is not None:
-                                self.frame_ready.emit(last_processed_frame, self._last_stats)
-                            else:
-                                self.frame_ready.emit(frame, self._last_stats)
+                            # Never resend stale processed overlays; use latest raw frame
+                            # if tracker-only rendering is not available.
+                            self._publish_frame(frame, self._last_stats)
                             pace_output()
                             continue
 
@@ -305,7 +695,7 @@ class VideoThread(QThread):
                     
                     last_processed_frame = processed_frame
                     self._last_stats = stats
-                    self.frame_ready.emit(processed_frame, stats)
+                    self._publish_frame(processed_frame, stats)
                     pace_output()
                 except TypeError:
                     # Backward-compat for processors that don't accept frame_timestamp.
@@ -318,7 +708,7 @@ class VideoThread(QThread):
 
                     last_processed_frame = processed_frame
                     self._last_stats = stats
-                    self.frame_ready.emit(processed_frame, stats)
+                    self._publish_frame(processed_frame, stats)
                     pace_output()
                 except Exception as e:
                     print(f"Error: {e}")
@@ -327,6 +717,11 @@ class VideoThread(QThread):
                     continue
                 
         finally:
+            if highres_timer_enabled and winmm is not None:
+                try:
+                    winmm.timeEndPeriod(1)
+                except Exception:
+                    pass
             if self.frame_buf is not None:
                 self.frame_buf.release()
                 self.frame_buf = None
@@ -345,6 +740,8 @@ class MainWindow(QMainWindow):
         
         # Initialize variables
         self.video_thread = None
+        self.model_loader_thread = None
+        self.stream_resolver_thread = None
         self.processor = None
         self.model_person = None
         self.model_vehicle = None
@@ -370,6 +767,8 @@ class MainWindow(QMainWindow):
         self.last_stats_text = ""
         self.last_fps_color = ""
         self.video_source = None
+        self.shared_frame_store = SharedFrameStore()
+        self.pending_frame_version = 0
         self.pending_display_frame = None
         self.pending_display_stats = {'total_objects': 0, 'class_counts': {}}
         self.pending_frame_dirty = False
@@ -388,6 +787,9 @@ class MainWindow(QMainWindow):
         # Debounced restart state for heavy changes while stream is running.
         self.pending_restart = False
         self.pending_reload_models = False
+        self.pending_start_after_model_load = False
+        self.models_loading = False
+        self.model_load_lowered_confidence = None
         self.restart_message = ""
         self.restart_timer = QTimer(self)
         self.restart_timer.setSingleShot(True)
@@ -449,12 +851,13 @@ class MainWindow(QMainWindow):
         left_panel.addLayout(title_row)
         
         # Video display label
-        self.video_label = QLabel()
+        self.video_label = VideoOpenGLWidget()
         self.video_label.setObjectName("videoSurface")
         self.video_label.setMinimumWidth(0)
         self.video_label.setMinimumHeight(320)
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.video_label.setAlignment(Qt.AlignCenter)
+        if hasattr(self.video_label, 'setAlignment'):
+            self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setText("Load video or livestream to begin")
         self.video_label.setMouseTracking(True)
         self.video_label.mousePressEvent = self.on_video_label_click
@@ -1134,7 +1537,7 @@ class MainWindow(QMainWindow):
                 border-radius: 16px;
                 padding: 8px 10px;
             }
-            QLabel#videoSurface {
+            QWidget#videoSurface {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                                             stop:0 #081018, stop:1 #152533);
                 border: 1px solid #0f1b27;
@@ -1427,61 +1830,98 @@ class MainWindow(QMainWindow):
         return True
         
     def load_models(self):
-        """Load YOLO models and tracker"""
+        """Load YOLO models + tracker in background so GUI stays responsive."""
+        if self.models_loading:
+            self.status_label.setText("Models are already loading...")
+            return
+
         self.status_label.setText("Loading models...")
         self._sync_processing_mode_buttons()
-        QApplication.processEvents()
-        
+
         try:
             self._shutdown_processor_workers()
-            # Set model choice in app state
             app_state.tracker_choice = self.tracker_combo.currentText()
             if not self._resolve_model_selection(self.model_combo.currentText(), prompt_for_custom=False):
                 self.status_label.setText("Select a valid model first")
                 return
-            lowered_confidence = self._apply_recommended_confidence_for_model()
-            
-            self.model_person, self.model_vehicle = load_yolo_models()
-            self.tracker = initialize_tracker(self.tracker_combo.currentText())
+            self.model_load_lowered_confidence = self._apply_recommended_confidence_for_model()
+        except Exception as exc:
+            self.status_label.setText(f"Error loading models: {exc}")
+            return
+
+        self.models_loading = True
+        self._set_model_loading_ui(True)
+
+        self.model_loader_thread = ModelLoadThread(self.tracker_combo.currentText())
+        self.model_loader_thread.progress.connect(self._on_model_load_progress)
+        self.model_loader_thread.loaded.connect(self._on_model_load_success)
+        self.model_loader_thread.failed.connect(self._on_model_load_error)
+        self.model_loader_thread.finished.connect(self._on_model_load_finished)
+        self.model_loader_thread.start()
+
+    def _set_model_loading_ui(self, loading: bool):
+        for widget in (
+            self.model_combo,
+            self.tracker_combo,
+            self.processing_mode_combo,
+            self.btn_load_video,
+            self.btn_open_source_file,
+            self.btn_start_stream,
+        ):
+            if widget:
+                widget.setEnabled(not loading)
+
+        if loading:
+            self.btn_start.setEnabled(False)
+
+    def _on_model_load_progress(self, message: str):
+        if message:
+            self.status_label.setText(message)
+
+    def _on_model_load_success(self, payload):
+        try:
+            self.model_person = payload.get('model_person')
+            self.model_vehicle = payload.get('model_vehicle')
+            self.tracker = payload.get('tracker')
+
             if hasattr(self.tracker, 'max_age'):
                 self.tracker_max_age = int(getattr(self.tracker, 'max_age', 1))
                 config.TRACKER_MAX_AGE = self.tracker_max_age
                 self.tracker_age_slider.blockSignals(True)
                 self.tracker_age_slider.setValue(self.tracker_max_age)
                 self.tracker_age_slider.blockSignals(False)
-                self.tracker_age_label.setText(f"{self.tracker_max_age} frame" if self.tracker_max_age == 1 else f"{self.tracker_max_age} frames")
+                self.tracker_age_label.setText(
+                    f"{self.tracker_max_age} frame" if self.tracker_max_age == 1 else f"{self.tracker_max_age} frames"
+                )
+
             self._sync_tracker_combo_with_runtime()
             app_state.tracker_choice = self._get_tracker_display_name(self.tracker)
+
             actual_backends = []
             for model in (self.model_person, self.model_vehicle):
                 backend_name = self._identify_model_backend(model)
                 if backend_name not in actual_backends:
                     actual_backends.append(backend_name)
+
             gpu_backend_active = any("CUDA" in backend for backend in actual_backends)
             cpu_only_mode = not gpu_backend_active
             selected_mode = self._get_processing_mode()
-            
-            # Create processor (ultra, optimized, threaded, or standard)
+
             if selected_mode == "ultra":
                 from src.processing.video_processor_ultra import UltraVideoProcessor
                 self.processor = UltraVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
-                print("Using Ultra Processor")
             elif selected_mode == "optimized":
                 from src.processing.video_processor_optimized import VideoProcessorOptimized
                 self.processor = VideoProcessorOptimized(self.model_person, self.model_vehicle, self.tracker)
-                print("Using Optimized Processor")
             elif selected_mode == "threaded":
                 from src.processing.video_processor_threaded import ThreadedVideoProcessor
                 self.processor = ThreadedVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
-                print("Using Threaded Processor")
             elif cpu_only_mode:
                 from src.processing.video_processor_ultra import UltraVideoProcessor
                 self.processor = UltraVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
-                print("Using Ultra Processor (CPU fallback)")
             else:
                 self.processor = VideoProcessor(self.model_person, self.model_vehicle, self.tracker)
-                print("Using Standard Processor")
-                
+
             self.processor.set_confidence(self.confidence_slider.value() / 100.0)
             if hasattr(self.processor, 'set_box_thickness'):
                 self.processor.set_box_thickness(self.box_thickness_slider.value())
@@ -1494,30 +1934,48 @@ class MainWindow(QMainWindow):
             if hasattr(self.processor, 'set_frame_skip'):
                 self.processor.set_frame_skip(self.frame_skip_slider.value())
             config.TRAIL_LENGTH = 3 if self.btn_trail_toggle.isChecked() else 0
-            
-            # Connect ROI manager to processor
             self.processor.set_roi_manager(self.roi_manager)
-            
-            # Update model info display
             self.update_model_info()
-            
+
             backend_text = " + ".join(actual_backends) if actual_backends else "CPU"
             display_model_name = self._get_selected_model_display_name()
+            lowered_confidence = self.model_load_lowered_confidence
 
             if cpu_only_mode and all("CPU" in backend for backend in actual_backends):
-                self.status_label.setText(f"Models loaded: {display_model_name} | Backend: CPU")
+                status_text = f"Models loaded: {display_model_name} | Backend: CPU"
             else:
-                self.status_label.setText(f"Models loaded: {display_model_name} | Backend: {backend_text}")
+                status_text = f"Models loaded: {display_model_name} | Backend: {backend_text}"
             if lowered_confidence is not None:
-                self.status_label.setText(
-                    f"Models loaded: {display_model_name} | Backend: {backend_text} | Conf auto -> 0.{lowered_confidence:02d}"
+                status_text = (
+                    f"Models loaded: {display_model_name} | Backend: {backend_text} | "
+                    f"Conf auto -> 0.{lowered_confidence:02d}"
                 )
+            self.status_label.setText(status_text)
+
+            self.btn_start.setEnabled(bool(self.video_source))
             self.btn_load_video.setEnabled(True)
             self.btn_open_source_file.setEnabled(True)
             self.btn_start_stream.setEnabled(True)
-            self.btn_start.setEnabled(bool(self.video_source))
-        except Exception as e:
-            self.status_label.setText(f"Error loading models: {e}")
+
+            if self.pending_start_after_model_load and self.video_source:
+                self.pending_start_after_model_load = False
+                QTimer.singleShot(0, self.start_processing)
+            else:
+                self.pending_start_after_model_load = False
+        except Exception as exc:
+            self.status_label.setText(f"Error loading models: {exc}")
+
+    def _on_model_load_error(self, error_text: str):
+        self.status_label.setText(f"Error loading models: {error_text}")
+        self.btn_start.setEnabled(False)
+
+    def _on_model_load_finished(self):
+        self.models_loading = False
+        self.model_load_lowered_confidence = None
+        self._set_model_loading_ui(False)
+        if self.model_loader_thread:
+            self.model_loader_thread.deleteLater()
+            self.model_loader_thread = None
 
     def _has_torch_cuda(self) -> bool:
         """Check whether torch has CUDA support in current runtime."""
@@ -2012,11 +2470,7 @@ class MainWindow(QMainWindow):
         try:
             # Clear processor cache
             if self.processor:
-                trails = getattr(self.processor, 'trails', None)
-                if isinstance(trails, dict):
-                    trails.clear()
-                if hasattr(self.processor, 'tracker') and hasattr(self.processor.tracker, 'tracks'):
-                    self.processor.tracker.tracks.clear()
+                _reset_processor_tracking_state(self.processor)
                 if hasattr(self.processor, 'frame_counter'):
                     self.processor.frame_counter = 0
             
@@ -2110,7 +2564,9 @@ class MainWindow(QMainWindow):
         self.pending_reload_models = False
         self.restart_message = ""
         if reload_models:
+            self.pending_start_after_model_load = bool(self.video_source)
             self.load_models()
+            return
         if self.video_source:
             self.start_processing()
     
@@ -2187,31 +2643,29 @@ class MainWindow(QMainWindow):
         click_x = event.pos().x()
         click_y = event.pos().y()
         
-        # Get current pixmap
-        pixmap = self.video_label.pixmap()
-        if not pixmap:
-            return
-        
-        # Get label dimensions
-        label_width = self.video_label.width()
-        label_height = self.video_label.height()
-        
         # Get actual frame size (from current_frame_size, not pixmap)
         frame_width, frame_height = self.current_frame_size
-        
-        # Calculate how the frame is scaled to fit in the label
-        # The frame is scaled to fit while maintaining aspect ratio
-        scale_w = label_width / frame_width
-        scale_h = label_height / frame_height
-        scale = min(scale_w, scale_h)
-        
-        # Calculate actual displayed size
-        display_width = int(frame_width * scale)
-        display_height = int(frame_height * scale)
-        
-        # Calculate offset (centering)
-        offset_x = (label_width - display_width) // 2
-        offset_y = (label_height - display_height) // 2
+
+        if hasattr(self.video_label, 'content_rect'):
+            draw_rect = self.video_label.content_rect((frame_width, frame_height))
+            offset_x = draw_rect.x()
+            offset_y = draw_rect.y()
+            display_width = draw_rect.width()
+            display_height = draw_rect.height()
+            if display_width <= 0 or display_height <= 0:
+                return
+            scale = display_width / frame_width
+        else:
+            # QLabel fallback path
+            label_width = self.video_label.width()
+            label_height = self.video_label.height()
+            scale_w = label_width / frame_width
+            scale_h = label_height / frame_height
+            scale = min(scale_w, scale_h)
+            display_width = int(frame_width * scale)
+            display_height = int(frame_height * scale)
+            offset_x = (label_width - display_width) // 2
+            offset_y = (label_height - display_height) // 2
         
         # Check if click is within displayed video area
         if click_x < offset_x or click_x > offset_x + display_width:
@@ -2371,95 +2825,56 @@ class MainWindow(QMainWindow):
         else:
             # Handle YouTube URL  
             if 'youtube.com' in stream_url or 'youtu.be' in stream_url:
-                try:
-                    import yt_dlp
-                    
-                    self.status_label.setText("🔄 Checking YouTube URL...")
-                    QApplication.processEvents()
-                    
-                    # Get quality
-                    quality_text = self.stream_quality_combo.currentText()
-                    if "1080p" in quality_text:
-                        quality_name = "1080p"
-                        height = 1080
-                    elif "720p" in quality_text:
-                        quality_name = "720p"
-                        height = 720
-                    elif "480p" in quality_text:
-                        quality_name = "480p"
-                        height = 480
-                    else:
-                        quality_name = "360p"
-                        height = 360
-                    
-                    # First check if it's a livestream
-                    ydl_opts_check = {
-                        'quiet': True,
-                        'no_warnings': True,
-                    }
-                    
-                    with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
-                        info = ydl.extract_info(stream_url, download=False)
-                        title = info.get('title', 'Unknown')[:30]
-                        is_live = info.get('is_live', False)
-                    
-                    if is_live:
-                        # LIVESTREAM - use URL directly (OpenCV will handle)
-                        self.status_label.setText(f"🔴 Live: {title}... (Getting URL)")
-                        QApplication.processEvents()
-                        
-                        ydl_opts = {
-                            'format': f'best[height<={height}]',
-                            'quiet': True,
-                        }
-                        
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            info = ydl.extract_info(stream_url, download=False)
-                            url = info['url']
-                        
-                        self.video_source = url
-                        self.status_label.setText(f"✅ 🔴 Live {quality_name}: {title}...")
-                    else:
-                        # REGULAR VIDEO - must download
-                        self.status_label.setText(f"⏬ Downloading: {title}...")
-                        QApplication.processEvents()
-                        
-                        import tempfile
-                        import os
-                        
-                        # Download to temp folder
-                        temp_dir = Path("temp")
-                        temp_dir.mkdir(exist_ok=True)
-                        
-                        import random
-                        import string
-                        random_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
-                        temp_file = temp_dir / f"downloaded_{random_id}.mp4"
-                        
-                        ydl_opts = {
-                            'format': f'best[height<={height}][ext=mp4]/best[height<={height}]',
-                            'outtmpl': str(temp_file),
-                            'quiet': False,
-                        }
-                        
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            ydl.download([stream_url])
-                        
-                        self.video_source = str(temp_file)
-                        self.status_label.setText(f"✅ 🎥 Video {quality_name}: {title}...")
-                        
-                except Exception as e:
-                    self.status_label.setText(f"❌ Error: {str(e)[:50]}")
-                    print(f"Full error: {e}")
+                if self.stream_resolver_thread and self.stream_resolver_thread.isRunning():
+                    self.status_label.setText("YouTube source is already being resolved...")
                     return
+
+                self.btn_start_stream.setEnabled(False)
+                self.btn_start.setEnabled(False)
+                self.status_label.setText("🔄 Checking YouTube URL...")
+                self.stream_resolver_thread = StreamResolveThread(
+                    stream_url,
+                    self.stream_quality_combo.currentText()
+                )
+                self.stream_resolver_thread.progress.connect(self._on_stream_resolve_progress)
+                self.stream_resolver_thread.resolved.connect(self._on_stream_resolved)
+                self.stream_resolver_thread.failed.connect(self._on_stream_resolve_failed)
+                self.stream_resolver_thread.finished.connect(self._on_stream_resolve_finished)
+                self.stream_resolver_thread.start()
+                return
             else:
                 self.video_source = stream_url
                 self._refresh_runtime_overview()
                 
         self.start_processing()
+
+    def _on_stream_resolve_progress(self, message: str):
+        if message:
+            self.status_label.setText(message)
+
+    def _on_stream_resolved(self, resolved_source, status_text: str):
+        self.video_source = resolved_source
+        self.status_label.setText(status_text)
+        self._refresh_runtime_overview()
+        self.start_processing()
+
+    def _on_stream_resolve_failed(self, error_text: str):
+        self.status_label.setText(f"❌ Error: {error_text[:120]}")
+        print(f"Full error: {error_text}")
+
+    def _on_stream_resolve_finished(self):
+        self.btn_start_stream.setEnabled(not self.models_loading)
+        self.btn_start.setEnabled((not self.models_loading) and bool(self.video_source) and bool(self.processor))
+        if self.stream_resolver_thread:
+            self.stream_resolver_thread.deleteLater()
+            self.stream_resolver_thread = None
         
     def start_processing(self):
         """Start video processing"""
+        if self.models_loading:
+            self.pending_start_after_model_load = True
+            self.status_label.setText("Models are loading... stream will start automatically.")
+            return
         if not self.processor:
             self.status_label.setText("⚠️ Models not loaded")
             return
@@ -2484,12 +2899,11 @@ class MainWindow(QMainWindow):
         self.video_thread.set_source(self.video_source)
         self.video_thread.set_processor(self.processor)
         self.video_thread.set_params(frame_skip, resize_scale, self.display_target_fps)
+        self.video_thread.set_shared_frame_store(self.shared_frame_store)
         self.video_thread.max_det = self.max_det  # Pass max_det
         self.video_thread.smooth_mode = self.smooth_mode
         self.video_thread.frame_ready.connect(self.update_frame)
         self.video_thread.finished.connect(self.on_processing_finished)
-        self.video_thread.start()
-        self.render_timer.start()
         
         # Update UI
         self.btn_start.setEnabled(False)
@@ -2512,9 +2926,15 @@ class MainWindow(QMainWindow):
         self.last_adaptive_tune_time = 0.0
         self.last_fps_color = ""
         self.last_stats_text = ""
+        self.shared_frame_store.clear()
+        self.pending_frame_version = 0
         self.pending_display_frame = None
         self.pending_display_stats = {'total_objects': 0, 'class_counts': {}}
         self.pending_frame_dirty = False
+        if hasattr(self.video_label, 'clear_frame'):
+            self.video_label.clear_frame()
+        self.video_thread.start()
+        self.render_timer.start()
         self._update_fps_summary(self.pending_display_stats)
         self._update_stats_panel(self.pending_display_stats)
         self._refresh_runtime_overview()
@@ -2524,10 +2944,15 @@ class MainWindow(QMainWindow):
         if not preserve_pending:
             self.pending_restart = False
             self.pending_reload_models = False
+            self.pending_start_after_model_load = False
             self.restart_timer.stop()
         if self.video_thread:
             self.video_thread.stop()
-            self.video_thread.wait()
+            if self.video_thread.isRunning():
+                self.status_label.setText("Stopping stream...")
+            while self.video_thread.isRunning():
+                self.video_thread.wait(30)
+                QApplication.processEvents()
         self._shutdown_processor_workers()
             
     def on_processing_finished(self):
@@ -2538,17 +2963,20 @@ class MainWindow(QMainWindow):
             self.pending_reload_models = False
             self.restart_message = ""
             if reload_models:
+                self.pending_start_after_model_load = bool(self.video_source)
                 self.load_models()
+                return
             self.start_processing()
             return
 
-        self.btn_start.setEnabled(True)
+        self.btn_start.setEnabled((not self.models_loading) and bool(self.video_source) and bool(self.processor))
         self.btn_stop.setEnabled(False)
-        self.btn_load_video.setEnabled(True)
-        self.btn_open_source_file.setEnabled(True)
-        self.btn_start_stream.setEnabled(True)
+        self.btn_load_video.setEnabled(not self.models_loading)
+        self.btn_open_source_file.setEnabled(not self.models_loading)
+        self.btn_start_stream.setEnabled(not self.models_loading)
         self.status_label.setText("Stopped")
         self.render_timer.stop()
+        self.pending_frame_version = 0
         self._refresh_runtime_overview()
 
     def _smooth_fps_value(self, current_value, sample_value):
@@ -2655,8 +3083,18 @@ class MainWindow(QMainWindow):
             self.stats_text.setPlainText(stats_text)
             self.last_stats_text = stats_text
         
-    def update_frame(self, frame, stats):
+    def update_frame(self, frame_version):
         """Receive the latest processed frame without doing heavy GUI work."""
+        if frame_version <= 0:
+            return
+
+        version, frame, stats = self.shared_frame_store.read()
+        if frame is None or version <= 0:
+            return
+        if version < self.pending_frame_version:
+            return
+
+        self.pending_frame_version = version
         self.pending_display_frame = frame
         self.pending_display_stats = stats
         self.pending_frame_dirty = True
@@ -2704,11 +3142,18 @@ class MainWindow(QMainWindow):
         if not self.pending_frame_dirty and not self.roi_drawing_mode:
             return
 
-        frame = self.pending_display_frame.copy()
+        frame = self.pending_display_frame
         self.pending_frame_dirty = False
 
         original_h, original_w = frame.shape[:2]
         self.current_frame_size = (original_w, original_h)
+
+        needs_overlay_copy = (
+            (self.roi_manager and self.roi_manager.is_active())
+            or (self.roi_drawing_mode and len(self.roi_temp_points) > 0)
+        )
+        if needs_overlay_copy:
+            frame = frame.copy()
 
         if self.roi_manager and self.roi_manager.is_active():
             self.roi_manager.draw_roi(frame)
@@ -2729,23 +3174,26 @@ class MainWindow(QMainWindow):
             text_overlay = f"ROI: {len(self.roi_temp_points)} points (Right-click to finish)"
             cv2.putText(frame, text_overlay, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        if not frame.flags['C_CONTIGUOUS']:
-            frame = np.ascontiguousarray(frame)
-        h, w, ch = frame.shape
-        bytes_per_line = ch * w
-
-        if hasattr(QImage, "Format_BGR888"):
-            qt_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_BGR888)
+        if hasattr(self.video_label, 'set_frame'):
+            self.video_label.set_frame(frame)
         else:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_image)
-        scaled_pixmap = pixmap.scaled(
-            self.video_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.FastTransformation
-        )
-        self.video_label.setPixmap(scaled_pixmap)
+            if not frame.flags['C_CONTIGUOUS']:
+                frame = np.ascontiguousarray(frame)
+            h, w, ch = frame.shape
+            bytes_per_line = ch * w
+
+            if hasattr(QImage, "Format_BGR888"):
+                qt_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_BGR888)
+            else:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qt_image)
+            scaled_pixmap = pixmap.scaled(
+                self.video_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.FastTransformation
+            )
+            self.video_label.setPixmap(scaled_pixmap)
 
         self.render_fps_counter += 1
         render_elapsed = time.perf_counter() - self.render_fps_start_time
@@ -2763,6 +3211,10 @@ class MainWindow(QMainWindow):
         
         if self.video_thread and self.video_thread.isRunning():
             self.stop_processing()
+        if self.model_loader_thread and self.model_loader_thread.isRunning():
+            self.model_loader_thread.wait(500)
+        if self.stream_resolver_thread and self.stream_resolver_thread.isRunning():
+            self.stream_resolver_thread.wait(500)
         event.accept()
     
     def save_settings(self):

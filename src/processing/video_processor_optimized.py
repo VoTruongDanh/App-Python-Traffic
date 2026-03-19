@@ -14,6 +14,7 @@ from contextlib import nullcontext
 import inspect
 import time
 from src.core import config
+from src.processing.video_processor import propagate_tracks
 
 # Try to import torch for FP16 support
 try:
@@ -167,6 +168,152 @@ class VideoProcessorOptimized:
                 frame_timestamp=frame_timestamp
             )
         return self.tracker.update_tracks(detections, frame=frame)
+
+    @staticmethod
+    def _get_track_velocity(track) -> tuple:
+        if hasattr(track, 'get_velocity'):
+            try:
+                vx, vy = track.get_velocity()
+                return float(vx), float(vy)
+            except Exception:
+                pass
+
+        vx = getattr(track, 'vx', 0.0)
+        vy = getattr(track, 'vy', 0.0)
+        return float(vx), float(vy)
+
+    def _get_render_tracks(self):
+        if hasattr(self.tracker, 'tracks'):
+            return list(self.tracker.tracks)
+
+        if hasattr(self.tracker, 'trackers'):
+            class _TrackSnapshot:
+                def __init__(self, track_id, bbox, cls_id, vx=0.0, vy=0.0, age=0):
+                    self.track_id = track_id
+                    self._bbox = bbox
+                    self.det_class = cls_id
+                    self.vx = float(vx)
+                    self.vy = float(vy)
+                    self.time_since_update = int(age)
+
+                def to_ltrb(self):
+                    return self._bbox
+
+                def is_confirmed(self):
+                    return True
+
+                def get_velocity(self):
+                    return self.vx, self.vy
+
+            render_tracks = []
+            max_staleness = max(1, min(2, getattr(self.tracker, 'max_age', 1)))
+            for tracker in getattr(self.tracker, 'trackers', []):
+                stale_age = int(getattr(tracker, 'time_since_update', 0))
+                if stale_age > max_staleness:
+                    continue
+                if not hasattr(tracker, 'get_state'):
+                    continue
+                bbox = tracker.get_state()[0]
+                vx = 0.0
+                vy = 0.0
+                try:
+                    state = tracker.kf.x.flatten()
+                    vx = float(state[4])
+                    vy = float(state[5])
+                except Exception:
+                    pass
+
+                render_tracks.append(
+                    _TrackSnapshot(
+                        getattr(tracker, 'id', -1),
+                        bbox,
+                        getattr(tracker, 'det_class', config.PERSON_CLASS),
+                        vx=vx,
+                        vy=vy,
+                        age=stale_age,
+                    )
+                )
+            return render_tracks
+
+        return []
+
+    def process_frame_tracking_only(self, frame: np.ndarray, frame_timestamp: float = None) -> Tuple[np.ndarray, Dict]:
+        """
+        Draw tracker state only, without running detector inference.
+        This path is used when the main loop skips heavy inference frames.
+        """
+        tracks = self._get_render_tracks()
+        det_ts = frame_timestamp if frame_timestamp else time.monotonic()
+
+        tracks_with_velocity = []
+        confirmed_tracks = []
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
+            ltrb = track.to_ltrb()
+            vx, vy = self._get_track_velocity(track)
+            tracks_with_velocity.append((
+                float(ltrb[0]),
+                float(ltrb[1]),
+                float(ltrb[2]),
+                float(ltrb[3]),
+                vx,
+                vy,
+                track.track_id,
+            ))
+            confirmed_tracks.append(track)
+
+        propagated_map = {}
+        if tracks_with_velocity:
+            propagated = propagate_tracks(
+                tracks_with_velocity,
+                render_ts=time.monotonic(),
+                det_ts=det_ts
+            )
+            propagated_map = {
+                tid: np.array([x1, y1, x2, y2], dtype=np.float32)
+                for x1, y1, x2, y2, tid in propagated
+            }
+
+        class_counts = {}
+        active_tracks = 0
+        for track in confirmed_tracks:
+            ltrb = propagated_map.get(track.track_id, np.asarray(track.to_ltrb(), dtype=np.float32))
+            cls_id = track.det_class
+            class_name = self._get_class_name(cls_id)
+            class_counts[class_name] = class_counts.get(class_name, 0) + 1
+            active_tracks += 1
+
+            base_color = config.get_class_color(cls_id)
+            stale_age = int(getattr(track, 'time_since_update', 0))
+            fade = max(0.35, 1.0 - (0.25 * stale_age))
+            color = tuple(int(max(0, min(255, c * fade))) for c in base_color)
+
+            cv2.rectangle(
+                frame,
+                (int(ltrb[0]), int(ltrb[1])),
+                (int(ltrb[2]), int(ltrb[3])),
+                color,
+                self.box_thickness
+            )
+            stale_suffix = " ~" if stale_age > 0 else ""
+            label = f"{class_name} ID:{track.track_id}{stale_suffix}"
+            cv2.putText(
+                frame,
+                label,
+                (int(ltrb[0]), int(ltrb[1]) - 5),
+                self.font,
+                self.font_scale,
+                color,
+                self.font_thickness
+            )
+
+        return frame, {
+            'active_objects': active_tracks,
+            'active_class_counts': class_counts,
+            'total_objects': active_tracks,
+            'class_counts': class_counts,
+        }
     
     def process_frame(
         self,
