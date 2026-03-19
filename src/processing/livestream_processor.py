@@ -44,12 +44,13 @@ class ThreadedCamera:
                 except queue.Empty:
                     pass
             
-            self.q.put(frame)
+            self.q.put((frame, time.monotonic()))
 
     def read(self):
         if not self.q.empty():
-            return True, self.q.get()
-        return self.status, None
+            frame, ts = self.q.get()
+            return True, frame, ts
+        return self.status, None, 0.0
 
     def release(self):
         self.reading = False
@@ -117,7 +118,7 @@ def process_livestream(stream_url, stream_type, confidence, frame_skip, resize_s
     try:
         while st.session_state.get('livestream_running', False):
             # Non-blocking read
-            ret, frame = cap.read()
+            ret, frame, frame_ts = cap.read()
             
             if not ret or frame is None:
                 if not cap.status:
@@ -142,7 +143,7 @@ def process_livestream(stream_url, stream_type, confidence, frame_skip, resize_s
                 frame = cv2.resize(frame, (new_w, new_h))
             
             # 3. Process
-            processed_frame, stats = processor.process_frame(frame)
+            processed_frame, stats = processor.process_frame(frame, frame_timestamp=frame_ts)
             
             # 4. Display Optimization: Ensure max display width 720p to save bandwidth
             disp_h, disp_w = processed_frame.shape[:2]

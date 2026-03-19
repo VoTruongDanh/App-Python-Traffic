@@ -5,6 +5,8 @@ import cv2
 import numpy as np
 from typing import Tuple, Dict, Set, List
 from contextlib import nullcontext
+import inspect
+import time
 from PIL import Image, ImageDraw, ImageFont
 from src.core import config
 from src.inference.person_classifier import PersonClassifier
@@ -19,17 +21,41 @@ except ImportError:
 class _TrackSnapshot:
     """Lightweight track adapter used for cached or tracker-only rendering."""
 
-    def __init__(self, track_id, bbox, cls_id, confirmed=True):
+    def __init__(self, track_id, bbox, cls_id, confirmed=True, vx=0.0, vy=0.0):
         self.track_id = track_id
         self._bbox = bbox
         self.det_class = cls_id
         self._confirmed = confirmed
+        self.vx = float(vx)
+        self.vy = float(vy)
 
     def to_ltrb(self):
         return self._bbox
 
     def is_confirmed(self):
         return self._confirmed
+
+    def get_velocity(self):
+        return self.vx, self.vy
+
+
+def propagate_tracks(tracks_with_velocity, render_ts: float, det_ts: float):
+    """
+    Dịch chuyển box theo velocity để bù độ trễ detect->render.
+    tracks_with_velocity: list (x1,y1,x2,y2,vx,vy,track_id)
+    """
+    dt = render_ts - det_ts
+    if dt <= 0 or dt > 0.3:
+        return [(t[0], t[1], t[2], t[3], t[6]) for t in tracks_with_velocity]
+
+    result = []
+    for (x1, y1, x2, y2, vx, vy, tid) in tracks_with_velocity:
+        nx1 = x1 + vx * dt
+        ny1 = y1 + vy * dt
+        nx2 = x2 + vx * dt
+        ny2 = y2 + vy * dt
+        result.append((nx1, ny1, nx2, ny2, tid))
+    return result
 
 
 class VideoProcessor:
@@ -81,12 +107,20 @@ class VideoProcessor:
             'total_objects': 0,
             'class_counts': {},
         }
+        self._last_det_ts = 0.0
+        self._tracker_accepts_timestamp = False
+        try:
+            params = inspect.signature(self.tracker.update_tracks).parameters
+            self._tracker_accepts_timestamp = 'frame_timestamp' in params
+        except Exception:
+            self._tracker_accepts_timestamp = False
     
     def reset_statistics(self):
         """Reset tất cả statistics"""
         self.unique_ids.clear()
         self.class_counts.clear()
         self.trails.clear()
+        self._last_det_ts = 0.0
         self.last_stats_snapshot = {
             'active_objects': 0,
             'active_class_counts': {},
@@ -248,8 +282,38 @@ class VideoProcessor:
                 w, h = x2 - x1, y2 - y1
                 detections.append([[x1, y1, w, h], conf, cls_id])
             return detections
+
+    def _update_tracker(self, detections, frame, frame_timestamp: float = None):
+        """Update tracker and pass frame timestamp only when supported."""
+        if self._tracker_accepts_timestamp and frame_timestamp is not None:
+            return self.tracker.update_tracks(
+                detections,
+                frame=frame,
+                frame_timestamp=frame_timestamp
+            )
+        return self.tracker.update_tracks(detections, frame=frame)
+
+    @staticmethod
+    def _get_track_velocity(track):
+        """Get (vx, vy) in px/s if available, otherwise return zeros."""
+        if hasattr(track, 'get_velocity'):
+            try:
+                vx, vy = track.get_velocity()
+                return float(vx), float(vy)
+            except Exception:
+                return 0.0, 0.0
+
+        vx = getattr(track, 'vx', 0.0)
+        vy = getattr(track, 'vy', 0.0)
+        return float(vx), float(vy)
     
-    def process_frame(self, frame: np.ndarray, resize_scale: int = 100, max_det: int = 20) -> Tuple[np.ndarray, Dict]:
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        resize_scale: int = 100,
+        max_det: int = 20,
+        frame_timestamp: float = None
+    ) -> Tuple[np.ndarray, Dict]:
         """
         Xử lý một frame với detection + tracking (STABLE & FAST)
         
@@ -352,19 +416,20 @@ class VideoProcessor:
         
         # Filter overlapping detections (additional NMS for cross-class)
         detections = self._filter_overlapping_detections(detections)
-        
+        self._last_det_ts = frame_timestamp if frame_timestamp else time.monotonic()
+
         # Tracking
-        tracks = self.tracker.update_tracks(detections, frame=frame)
+        tracks = self._update_tracker(detections, frame=frame, frame_timestamp=self._last_det_ts)
         
         # Draw results
-        processed_frame = self._draw_detections(frame, tracks)
+        processed_frame = self._draw_detections(frame, tracks, det_ts=self._last_det_ts)
         
         # Update statistics
         stats = self._build_stats_payload(tracks)
         
         return processed_frame, stats
 
-    def process_frame_tracking_only(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict]:
+    def process_frame_tracking_only(self, frame: np.ndarray, frame_timestamp: float = None) -> Tuple[np.ndarray, Dict]:
         """
         Reuse the latest tracker state and draw cached overlays without running
         detector inference. This keeps playback close to 1x when inference
@@ -374,7 +439,8 @@ class VideoProcessor:
         self._frame_person_types = {}
 
         tracks = self._get_render_tracks()
-        processed_frame = self._draw_detections(frame, tracks)
+        det_ts = frame_timestamp if frame_timestamp else self._last_det_ts
+        processed_frame = self._draw_detections(frame, tracks, det_ts=det_ts)
         stats = self._build_stats_payload(tracks, update_totals=False)
         return processed_frame, stats
     
@@ -422,7 +488,7 @@ class VideoProcessor:
         
         return filtered
     
-    def _draw_detections(self, frame: np.ndarray, tracks) -> np.ndarray:
+    def _draw_detections(self, frame: np.ndarray, tracks, det_ts: float = 0.0) -> np.ndarray:
         """
         Vẽ bounding boxes, labels, và trails lên frame
         """
@@ -432,14 +498,39 @@ class VideoProcessor:
         # First pass: collect all vehicle tracks
         vehicle_tracks = []
         person_tracks = []
-        
+
+        confirmed_tracks = []
+        tracks_with_velocity = []
         for track in tracks:
             if not track.is_confirmed():
                 continue
-            
+
+            confirmed_tracks.append(track)
+            ltrb = track.to_ltrb()
+            vx, vy = self._get_track_velocity(track)
+            tracks_with_velocity.append((
+                float(ltrb[0]),
+                float(ltrb[1]),
+                float(ltrb[2]),
+                float(ltrb[3]),
+                vx,
+                vy,
+                track.track_id,
+            ))
+
+        propagated_map = {}
+        if tracks_with_velocity:
+            render_ts = time.monotonic()
+            propagated = propagate_tracks(tracks_with_velocity, render_ts=render_ts, det_ts=det_ts)
+            propagated_map = {
+                tid: np.array([x1, y1, x2, y2], dtype=np.float32)
+                for x1, y1, x2, y2, tid in propagated
+            }
+
+        for track in confirmed_tracks:
             track_id = track.track_id
             current_track_ids.add(track_id)
-            ltrb = track.to_ltrb()
+            ltrb = propagated_map.get(track_id, np.asarray(track.to_ltrb(), dtype=np.float32))
             cls_id = track.det_class
             
             # ROI filtering - skip if outside ROI
@@ -743,11 +834,21 @@ class VideoProcessor:
                 if not hasattr(tracker, 'get_state'):
                     continue
                 bbox = tracker.get_state()[0]
+                vx = 0.0
+                vy = 0.0
+                try:
+                    state = tracker.kf.x.flatten()
+                    vx = float(state[4])
+                    vy = float(state[5])
+                except Exception:
+                    pass
                 render_tracks.append(
                     _TrackSnapshot(
                         getattr(tracker, 'id', -1),
                         bbox,
                         getattr(tracker, 'det_class', config.PERSON_CLASS),
+                        vx=vx,
+                        vy=vy,
                     )
                 )
             return render_tracks

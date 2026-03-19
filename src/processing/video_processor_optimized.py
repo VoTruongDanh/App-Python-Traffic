@@ -11,6 +11,8 @@ import cv2
 import numpy as np
 from typing import Tuple, Dict, Optional
 from contextlib import nullcontext
+import inspect
+import time
 from src.core import config
 
 # Try to import torch for FP16 support
@@ -59,6 +61,12 @@ class VideoProcessorOptimized:
         # Frame counter for periodic cleanup
         self.frame_counter = 0
         self.cleanup_interval = 30
+        self._tracker_accepts_timestamp = False
+        try:
+            params = inspect.signature(self.tracker.update_tracks).parameters
+            self._tracker_accepts_timestamp = 'frame_timestamp' in params
+        except Exception:
+            self._tracker_accepts_timestamp = False
 
     def _inference_context(self):
         if TORCH_AVAILABLE:
@@ -150,8 +158,23 @@ class VideoProcessorOptimized:
             if self.roi_manager.is_object_in_roi([x1, y1, x1 + w, y1 + h]):
                 filtered.append([bbox, conf, cls_id])
         return filtered
+
+    def _update_tracker(self, detections, frame, frame_timestamp: float = None):
+        if self._tracker_accepts_timestamp and frame_timestamp is not None:
+            return self.tracker.update_tracks(
+                detections,
+                frame=frame,
+                frame_timestamp=frame_timestamp
+            )
+        return self.tracker.update_tracks(detections, frame=frame)
     
-    def process_frame(self, frame: np.ndarray, resize_scale: int = 100, max_det: int = 20) -> Tuple[np.ndarray, Dict]:
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        resize_scale: int = 100,
+        max_det: int = 20,
+        frame_timestamp: float = None
+    ) -> Tuple[np.ndarray, Dict]:
         """
         Ultra-optimized frame processing for 40+ FPS
         Uses batch tensor transfer and optional FP16 inference
@@ -193,7 +216,8 @@ class VideoProcessorOptimized:
         detections = self._filter_roi_detections(detections)
         
         # Fast tracking
-        tracks = self.tracker.update_tracks(detections, frame=frame) if detections else []
+        det_ts = frame_timestamp if frame_timestamp else time.monotonic()
+        tracks = self._update_tracker(detections, frame=frame, frame_timestamp=det_ts)
         
         # Minimal drawing with optimized loop
         class_counts = {}

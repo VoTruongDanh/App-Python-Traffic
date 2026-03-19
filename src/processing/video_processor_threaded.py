@@ -158,7 +158,13 @@ class ThreadedVideoProcessor(VideoProcessor):
         
         return detections
     
-    def process_frame_threaded(self, frame: np.ndarray, resize_scale: int = 100, max_det: int = 20) -> Tuple[np.ndarray, Dict]:
+    def process_frame_threaded(
+        self,
+        frame: np.ndarray,
+        resize_scale: int = 100,
+        max_det: int = 20,
+        frame_timestamp: float = None
+    ) -> Tuple[np.ndarray, Dict]:
         """
         Process frame with parallel inference and drawing
         """
@@ -195,10 +201,11 @@ class ThreadedVideoProcessor(VideoProcessor):
         detections = self._filter_overlapping_detections(detections)
         
         # Tracking (main thread)
-        tracks = self.tracker.update_tracks(detections, frame=frame)
+        det_ts = frame_timestamp if frame_timestamp else 0.0
+        tracks = self._update_tracker(detections, frame=frame, frame_timestamp=det_ts if det_ts > 0 else None)
         
         # Drawing (main thread - fast)
-        processed_frame = self._draw_detections(frame, tracks)
+        processed_frame = self._draw_detections(frame, tracks, det_ts=det_ts)
         
         # Update statistics
         stats = self._update_statistics(tracks)

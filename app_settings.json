@@ -20,33 +20,8 @@
   "video_type": "\ud83d\udd34 Livestream",
   "last_video_file_path": null,
   "roi_threshold": 50,
-  "roi_visible": true,
-  "roi_config": {
-    "points": [
-      [
-        16,
-        260
-      ],
-      [
-        643,
-        128
-      ],
-      [
-        1224,
-        191
-      ],
-      [
-        1026,
-        668
-      ],
-      [
-        31,
-        669
-      ]
-    ],
-    "threshold": 0.5,
-    "active": true
-  },
-  "sidebar_visible": false,
+  "roi_visible": false,
+  "roi_config": null,
+  "sidebar_visible": true,
   "runtime_expanded": false
 }

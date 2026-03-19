@@ -67,8 +67,8 @@ INFERENCE_SIZE = 640  # Standard YOLO input size
 # =============================================================================
 # TRACKING PARAMETERS (DeepSORT)
 # =============================================================================
-TRACKER_MAX_AGE = 15  # Tăng từ 2 → 15 (giữ track lâu khi lag/skip frames)
-TRACKER_N_INIT = 1    # Giữ 1 (confirm nhanh)
+TRACKER_MAX_AGE = 1   # Kill ghost nhanh sau 1 frame miss
+TRACKER_N_INIT = 2    # Confirm track sau 2 hits lien tiep
 TRACKER_NMS_MAX_OVERLAP = 1.0
 
 # =============================================================================
@@ -137,3 +137,4 @@ PIXEL_FORMAT = 'yuv420p'  # Pixel format cho browser compatibility
 # =============================================================================
 TEMP_DIR = "temp"
 OUTPUT_DIR = "output"
+

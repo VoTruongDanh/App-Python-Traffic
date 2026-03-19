@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 from src.processing.video_processor import VideoProcessor
+from src.processing.latest_frame_buffer import LatestFrameBuffer
 # from src.processing.video_processor_optimized import VideoProcessorOptimized as VideoProcessor
 from src.tracking.roi_manager import ROIManager
 
@@ -52,6 +53,7 @@ class VideoThread(QThread):
         
         self.frame_buffer = []  # DISABLED: Buffer causes 2-3 frame delay
         self.max_buffer_size = 1  # Keep only 1 frame (effectively disabled)
+        self.frame_buf = None
         self._last_stats = {'total_objects': 0, 'class_counts': {}}
         
     def set_source(self, source):
@@ -78,6 +80,8 @@ class VideoThread(QThread):
         
         # Detect if RTSP stream
         is_rtsp = isinstance(self.source, str) and self.source.startswith('rtsp://')
+        is_livestream = is_rtsp or (isinstance(self.source, str) and ('http' in self.source or 'https' in self.source))
+        use_latest_buffer = is_livestream
         
         # For RTSP, use FFMPEG backend with special flags
         if is_rtsp:
@@ -99,6 +103,8 @@ class VideoThread(QThread):
             print(f"Error: Cannot open source {self.source}")
             self.finished.emit()
             return
+
+        self.frame_buf = LatestFrameBuffer(cap) if use_latest_buffer else None
             
         frame_count = 0
         skip_counter = 0
@@ -117,8 +123,6 @@ class VideoThread(QThread):
         frame_interval = 1.0 / target_output_fps
         next_emit_deadline = time.perf_counter()
         
-        # Detect source type for pacing
-        is_livestream = is_rtsp or (isinstance(self.source, str) and ('http' in self.source or 'https' in self.source))
         playback_clock_start = time.perf_counter()
 
         def pace_output():
@@ -149,7 +153,7 @@ class VideoThread(QThread):
             """
             nonlocal source_frame_index, playback_clock_start
 
-            if is_livestream or source_fps <= 0:
+            if is_livestream or source_fps <= 0 or self.frame_buf is not None:
                 return
 
             elapsed = time.perf_counter() - playback_clock_start
@@ -176,15 +180,19 @@ class VideoThread(QThread):
 
                 sync_file_source_to_clock()
 
-                # For RTSP, always grab latest frame (discard buffered frames)
-                if is_rtsp:
-                    # Single grab is enough - reduced from 2 for better latency
-                    cap.grab()
-                elif is_livestream and time.perf_counter() > (next_emit_deadline + frame_interval):
-                    # Drop one stale buffered frame when live playback falls behind.
-                    cap.grab()
-                
-                ret, frame = cap.read()
+                frame_ts = 0.0
+                if self.frame_buf is None:
+                    # For direct capture, aggressively drop stale live frames.
+                    if is_rtsp:
+                        cap.grab()
+                    elif is_livestream and time.perf_counter() > (next_emit_deadline + frame_interval):
+                        cap.grab()
+                    ret, frame = cap.read()
+                    if ret:
+                        frame_ts = time.monotonic()
+                else:
+                    ret, frame, frame_ts = self.frame_buf.read()
+
                 if ret:
                     source_frame_index += 1
                     loop_lag = time.perf_counter() - next_emit_deadline
@@ -194,15 +202,21 @@ class VideoThread(QThread):
                     time_since_last = time.time() - last_success_time
                     
                     # For RTSP, reconnect faster
-                    if is_rtsp and consecutive_failures > 10:
+                    if is_rtsp and consecutive_failures > 10 and time_since_last > 0.5:
                         print(f"⚠️ RTSP connection issue, attempting reconnect...")
-                        cap.release()
+                        if self.frame_buf is not None:
+                            self.frame_buf.release()
+                            self.frame_buf = None
+                        else:
+                            cap.release()
                         time.sleep(0.5)
                         import os
                         os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;udp|fflags;nobuffer|flags;low_delay'
                         cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
                         cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
                         cap.set(cv2.CAP_PROP_FPS, 30)
+                        if use_latest_buffer and cap.isOpened():
+                            self.frame_buf = LatestFrameBuffer(cap)
                         consecutive_failures = 0
                         
                         # Reset tracker immediately on reconnect
@@ -270,12 +284,38 @@ class VideoThread(QThread):
                 
                 try:
                     if use_tracking_only:
+                        processed_frame, stats = self.processor.process_frame_tracking_only(
+                            process_frame,
+                            frame_timestamp=frame_ts
+                        )
+                    elif hasattr(self.processor, 'process_frame_threaded'):
+                        processed_frame, stats = self.processor.process_frame_threaded(
+                            process_frame,
+                            self.resize_scale,
+                            self.max_det,
+                            frame_timestamp=frame_ts
+                        )
+                    else:
+                        processed_frame, stats = self.processor.process_frame(
+                            process_frame,
+                            self.resize_scale,
+                            self.max_det,
+                            frame_timestamp=frame_ts
+                        )
+                    
+                    last_processed_frame = processed_frame
+                    self._last_stats = stats
+                    self.frame_ready.emit(processed_frame, stats)
+                    pace_output()
+                except TypeError:
+                    # Backward-compat for processors that don't accept frame_timestamp.
+                    if use_tracking_only:
                         processed_frame, stats = self.processor.process_frame_tracking_only(process_frame)
                     elif hasattr(self.processor, 'process_frame_threaded'):
                         processed_frame, stats = self.processor.process_frame_threaded(process_frame, self.resize_scale, self.max_det)
                     else:
                         processed_frame, stats = self.processor.process_frame(process_frame, self.resize_scale, self.max_det)
-                    
+
                     last_processed_frame = processed_frame
                     self._last_stats = stats
                     self.frame_ready.emit(processed_frame, stats)
@@ -287,7 +327,11 @@ class VideoThread(QThread):
                     continue
                 
         finally:
-            cap.release()
+            if self.frame_buf is not None:
+                self.frame_buf.release()
+                self.frame_buf = None
+            else:
+                cap.release()
             self.finished.emit()
 
 
@@ -337,7 +381,7 @@ class MainWindow(QMainWindow):
         self.last_adaptive_tune_time = 0.0
         self.adaptive_tune_cooldown = 6.0
         self.render_timer = QTimer(self)
-        self.render_timer.setInterval(int(1000 / self.display_target_fps))
+        self.render_timer.setInterval(33)
         self.render_timer.setTimerType(Qt.PreciseTimer)
         self.render_timer.timeout.connect(self._render_latest_frame)
 
@@ -351,7 +395,7 @@ class MainWindow(QMainWindow):
         
         # Detection settings
         self.max_det = 20  # Default max detections
-        self.tracker_max_age = 15  # Default tracker max age
+        self.tracker_max_age = 1  # Default tracker max age
         self.use_threaded_mode = False  # Default: standard mode
         self.use_optimized_mode = False  # Default: standard mode
         self.use_ultra_mode = False  # NEW: Ultra mode for max FPS
@@ -669,7 +713,7 @@ class MainWindow(QMainWindow):
         self.tracker_age_slider = QSlider(Qt.Horizontal)
         self.tracker_age_slider.setMinimum(1)
         self.tracker_age_slider.setMaximum(30)
-        self.tracker_age_slider.setValue(15)  # Default: 15
+        self.tracker_age_slider.setValue(1)  # Default: 1
         self.tracker_age_slider.valueChanged.connect(self.on_tracker_age_changed)
         self.tracker_age_slider.setToolTip(
             "How long to keep track without detection\n"
@@ -678,7 +722,7 @@ class MainWindow(QMainWindow):
         )
         detection_layout.addWidget(self.tracker_age_slider)
         
-        self.tracker_age_label = QLabel("15 frames")
+        self.tracker_age_label = QLabel("1 frame")
         detection_layout.addWidget(self.tracker_age_label)
         
         detection_group.setLayout(detection_layout)
@@ -1399,6 +1443,13 @@ class MainWindow(QMainWindow):
             
             self.model_person, self.model_vehicle = load_yolo_models()
             self.tracker = initialize_tracker(self.tracker_combo.currentText())
+            if hasattr(self.tracker, 'max_age'):
+                self.tracker_max_age = int(getattr(self.tracker, 'max_age', 1))
+                config.TRACKER_MAX_AGE = self.tracker_max_age
+                self.tracker_age_slider.blockSignals(True)
+                self.tracker_age_slider.setValue(self.tracker_max_age)
+                self.tracker_age_slider.blockSignals(False)
+                self.tracker_age_label.setText(f"{self.tracker_max_age} frame" if self.tracker_max_age == 1 else f"{self.tracker_max_age} frames")
             self._sync_tracker_combo_with_runtime()
             app_state.tracker_choice = self._get_tracker_display_name(self.tracker)
             actual_backends = []

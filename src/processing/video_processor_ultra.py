@@ -15,6 +15,7 @@ from typing import Tuple, Dict, Optional
 from collections import deque
 import threading
 import time
+import inspect
 from contextlib import nullcontext
 from src.core import config
 
@@ -82,6 +83,12 @@ class UltraVideoProcessor:
         # Memory management
         self.frame_counter = 0
         self.cleanup_interval = 50
+        self._tracker_accepts_timestamp = False
+        try:
+            params = inspect.signature(self.tracker.update_tracks).parameters
+            self._tracker_accepts_timestamp = 'frame_timestamp' in params
+        except Exception:
+            self._tracker_accepts_timestamp = False
         
         print("🚀 UltraVideoProcessor initialized with async double-buffer pipeline")
 
@@ -247,6 +254,15 @@ class UltraVideoProcessor:
                 filtered.append([bbox, conf, cls_id])
         return filtered
 
+    def _update_tracker(self, detections, frame, frame_timestamp: float = None):
+        if self._tracker_accepts_timestamp and frame_timestamp is not None:
+            return self.tracker.update_tracks(
+                detections,
+                frame=frame,
+                frame_timestamp=frame_timestamp
+            )
+        return self.tracker.update_tracks(detections, frame=frame)
+
     def _draw_tracks(self, frame: np.ndarray, tracks) -> Dict:
         """Draw current tracks on a frame and return class counts."""
         class_counts = {}
@@ -310,7 +326,13 @@ class UltraVideoProcessor:
             'class_counts': self.class_counts_total.copy(),
         }
 
-    def process_frame_threaded(self, frame: np.ndarray, resize_scale: int = 100, max_det: int = 20) -> Tuple[np.ndarray, Dict]:
+    def process_frame_threaded(
+        self,
+        frame: np.ndarray,
+        resize_scale: int = 100,
+        max_det: int = 20,
+        frame_timestamp: float = None
+    ) -> Tuple[np.ndarray, Dict]:
         """
         Async frame processing for smoother playback.
 
@@ -340,10 +362,8 @@ class UltraVideoProcessor:
                 self.last_detections = latest_detections
                 detections = self._filter_roi_detections(latest_detections)
 
-        try:
-            tracks = self.tracker.update_tracks(detections, frame=frame)
-        except Exception:
-            tracks = self.tracker.update_tracks(detections) if detections else []
+        det_ts = frame_timestamp if frame_timestamp else time.monotonic()
+        tracks = self._update_tracker(detections, frame=frame, frame_timestamp=det_ts)
 
         stats = self._draw_tracks(frame, tracks)
 
@@ -353,7 +373,13 @@ class UltraVideoProcessor:
 
         return frame, stats
     
-    def process_frame(self, frame: np.ndarray, resize_scale: int = 100, max_det: int = 20) -> Tuple[np.ndarray, Dict]:
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        resize_scale: int = 100,
+        max_det: int = 20,
+        frame_timestamp: float = None
+    ) -> Tuple[np.ndarray, Dict]:
         """
         SYNC optimized frame processing
         Uses current frame detections (not async) to avoid flickering
@@ -364,7 +390,8 @@ class UltraVideoProcessor:
         detections = self._filter_roi_detections(detections)
         
         # Tracking with CURRENT frame detections
-        tracks = self.tracker.update_tracks(detections, frame=frame) if detections else []
+        det_ts = frame_timestamp if frame_timestamp else time.monotonic()
+        tracks = self._update_tracker(detections, frame=frame, frame_timestamp=det_ts)
         
         stats = self._draw_tracks(frame, tracks)
         

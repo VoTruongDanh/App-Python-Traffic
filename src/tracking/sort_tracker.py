@@ -4,6 +4,7 @@ Fast tracking algorithm using Kalman Filter + Hungarian Algorithm
 Faster than DeepSORT, more stable than Simple tracker
 """
 import numpy as np
+import time
 from scipy.optimize import linear_sum_assignment
 from filterpy.kalman import KalmanFilter
 
@@ -36,13 +37,13 @@ class KalmanBoxTracker:
             [0,0,0,0,1,0,0],
             [0,0,0,0,0,1,0],
             [0,0,0,0,0,0,1]
-        ])
+        ], dtype=float)
         self.kf.H = np.array([
             [1,0,0,0,0,0,0],
             [0,1,0,0,0,0,0],
             [0,0,1,0,0,0,0],
             [0,0,0,1,0,0,0]
-        ])
+        ], dtype=float)
         
         self.kf.R[2:,2:] *= 10.
         self.kf.P[4:,4:] *= 1000.
@@ -72,14 +73,20 @@ class KalmanBoxTracker:
         self.hit_streak += 1
         self.kf.update(self._convert_bbox_to_z(bbox))
         
-    def predict(self):
+    def predict(self, dt: float = 1.0):
         """
         Predict next state
         
         Returns:
             Predicted bbox [x1, y1, x2, y2]
         """
-        if (self.kf.x[6] + self.kf.x[2]) <= 0:
+        dt = max(1e-3, float(dt))
+        # State = [x, y, s, r, vx, vy, vs]
+        self.kf.F[0, 4] = dt
+        self.kf.F[1, 5] = dt
+        self.kf.F[2, 6] = dt
+
+        if (self.kf.x[2] + (self.kf.x[6] * dt)) <= 0:
             self.kf.x[6] *= 0.0
         self.kf.predict()
         self.age += 1
@@ -129,7 +136,7 @@ class SORTTracker:
     SORT Tracker - Simple Online and Realtime Tracking
     """
     
-    def __init__(self, max_age=3, min_hits=1, iou_threshold=0.3):
+    def __init__(self, max_age=1, min_hits=2, iou_threshold=0.15):
         """
         Initialize SORT tracker
         
@@ -143,8 +150,9 @@ class SORTTracker:
         self.iou_threshold = iou_threshold
         self.trackers = []
         self.frame_count = 0
+        self._last_ts = time.monotonic()
         
-    def update(self, detections):
+    def update(self, detections, frame_timestamp: float = None):
         """
         Update tracker with new detections
         
@@ -154,6 +162,10 @@ class SORTTracker:
         Returns:
             List of active tracks with format compatible with DeepSORT
         """
+        now = frame_timestamp if frame_timestamp else time.monotonic()
+        dt = min(max(now - self._last_ts, 1e-3), 0.5)
+        self._last_ts = now
+
         self.frame_count += 1
         
         # Convert detections to [x1, y1, x2, y2, conf, cls]
@@ -169,7 +181,7 @@ class SORTTracker:
         trks = np.zeros((len(self.trackers), 5))
         to_del = []
         for t, trk in enumerate(trks):
-            pos = self.trackers[t].predict()[0]
+            pos = self.trackers[t].predict(dt=dt)[0]
             trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
             if np.any(np.isnan(pos)):
                 to_del.append(t)
@@ -198,21 +210,36 @@ class SORTTracker:
         for trk in self.trackers:
             if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
                 d = trk.get_state()[0]
+                vx, vy = self.get_velocity(trk)
                 # Create track object compatible with DeepSORT
                 class Track:
-                    def __init__(self, track_id, det_class, det_conf, bbox):
+                    def __init__(self, track_id, det_class, det_conf, bbox, vx=0.0, vy=0.0, det_ts=0.0):
                         self.track_id = track_id
                         self.det_class = det_class
                         self.det_conf = det_conf
                         self._bbox = bbox
+                        self.vx = vx
+                        self.vy = vy
+                        self.det_ts = det_ts
                     
                     def to_ltrb(self):
                         return self._bbox
                     
                     def is_confirmed(self):
                         return True
+
+                    def get_velocity(self):
+                        return self.vx, self.vy
                 
-                track = Track(trk.id, getattr(trk, 'det_class', 0), getattr(trk, 'det_conf', 1.0), d)
+                track = Track(
+                    trk.id,
+                    getattr(trk, 'det_class', 0),
+                    getattr(trk, 'det_conf', 1.0),
+                    d,
+                    vx=vx,
+                    vy=vy,
+                    det_ts=now,
+                )
                 tracks.append(track)
                 
         # Remove dead trackers
@@ -283,8 +310,19 @@ class SORTTracker:
             
         return matches, np.array(unmatched_detections), np.array(unmatched_trackers)
     
-    def update_tracks(self, detections, frame=None):
+    @staticmethod
+    def get_velocity(kalman_tracker) -> tuple:
+        """
+        Lấy vx, vy từ KalmanBoxTracker của SORT.
+        State SORT: [cx, cy, s, r, dcx, dcy, ds]
+        """
+        state = kalman_tracker.kf.x.flatten()
+        vx = float(state[4])
+        vy = float(state[5])
+        return vx, vy
+
+    def update_tracks(self, detections, frame=None, frame_timestamp: float = None):
         """
         Wrapper method compatible with DeepSORT interface
         """
-        return self.update(detections)
+        return self.update(detections, frame_timestamp=frame_timestamp)

@@ -343,9 +343,9 @@ def initialize_tracker(tracker_type='SORT (Fast)'):
             from src.tracking.sort_tracker import SORTTracker
             print("✅ Using SORT tracker")
             return SORTTracker(
-                max_age=config.TRACKER_MAX_AGE,
-                min_hits=config.TRACKER_N_INIT,
-                iou_threshold=0.2  # Giảm từ 0.3 → 0.2 (match dễ hơn khi lag)
+                max_age=1,
+                min_hits=2,
+                iou_threshold=0.15
             )
         except ImportError as e:
             print(f"⚠️  SORT tracker not available: {e}")
@@ -363,9 +363,9 @@ def initialize_tracker(tracker_type='SORT (Fast)'):
             from src.tracking.sort_tracker import SORTTracker
             print("DeepSort on CPU -> fallback to SORT for FPS")
             return SORTTracker(
-                max_age=config.TRACKER_MAX_AGE,
-                min_hits=config.TRACKER_N_INIT,
-                iou_threshold=0.2
+                max_age=1,
+                min_hits=2,
+                iou_threshold=0.15
             )
         except ImportError:
             try:
@@ -380,8 +380,11 @@ def initialize_tracker(tracker_type='SORT (Fast)'):
 
     print("Using DeepSort tracker")
     tracker = DeepSort(
-        max_age=config.TRACKER_MAX_AGE,
-        n_init=config.TRACKER_N_INIT,
+        max_age=1,
+        n_init=2,
+        max_iou_distance=0.85,
+        max_cosine_distance=0.4,
+        nn_budget=None,
         nms_max_overlap=config.TRACKER_NMS_MAX_OVERLAP,
         embedder='mobilenet',
         embedder_gpu=use_gpu
