@@ -1,18 +1,18 @@
 {
   "model_choice": "Custom model...",
   "custom_model_path": "D:/BaiTapSinhVien/DoAnKySu/UI/trainv4/yolo3v4.onnx",
-  "tracker_choice": "DeepSORT (Stable)",
-  "confidence": 25,
+  "tracker_choice": "SORT (Fast)",
+  "confidence": 70,
   "box_thickness": 2,
-  "font_size": 12,
+  "font_size": 21,
   "font_thickness": 2,
-  "display_point_mode": true,
+  "display_point_mode": false,
   "trail_enabled": false,
   "max_det": 99,
-  "tracker_age": 30,
+  "tracker_age": 1,
   "frame_skip": 0,
   "resize_scale": "100% (Full Quality)",
-  "smooth_mode": true,
+  "smooth_mode": false,
   "processing_mode": "standard",
   "adaptive_fps": false,
   "stream_input": "https://www.youtube.com/watch?v=1EiC9bvVGnk",
@@ -23,5 +23,5 @@
   "roi_visible": false,
   "roi_config": null,
   "sidebar_visible": true,
-  "runtime_expanded": false
+  "runtime_expanded": true
 }

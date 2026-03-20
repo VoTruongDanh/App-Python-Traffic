@@ -23,7 +23,6 @@ from PyQt5.QtGui import (
     QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture
 )
 import time
-import ctypes
 from pathlib import Path
 
 from src.processing.video_processor import VideoProcessor
@@ -312,6 +311,28 @@ class StreamResolveThread(QThread):
             return "480p", 480
         return "360p", 360
 
+    @staticmethod
+    def _yt_logger():
+        class _QuietLogger:
+            def debug(self, msg):
+                return
+
+            def warning(self, msg):
+                return
+
+            def error(self, msg):
+                return
+
+        return _QuietLogger()
+
+    @staticmethod
+    def _js_runtime_options():
+        return {
+            'quiet': True,
+            'no_warnings': True,
+            'logger': StreamResolveThread._yt_logger(),
+        }
+
     def run(self):
         try:
             import yt_dlp
@@ -321,10 +342,7 @@ class StreamResolveThread(QThread):
             quality_name, height = self._quality_to_profile(self.quality_text)
             self.progress.emit("🔄 Checking YouTube URL...")
 
-            ydl_opts_check = {
-                'quiet': True,
-                'no_warnings': True,
-            }
+            ydl_opts_check = self._js_runtime_options()
             with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
                 info = ydl.extract_info(self.stream_url, download=False)
                 title = info.get('title', 'Unknown')[:30]
@@ -334,8 +352,8 @@ class StreamResolveThread(QThread):
                 self.progress.emit(f"🔴 Live: {title}... (Getting URL)")
                 ydl_opts = {
                     'format': f'best[height<={height}]',
-                    'quiet': True,
                 }
+                ydl_opts.update(self._js_runtime_options())
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(self.stream_url, download=False)
                     resolved_url = info['url']
@@ -351,8 +369,8 @@ class StreamResolveThread(QThread):
             ydl_opts = {
                 'format': f'best[height<={height}][ext=mp4]/best[height<={height}]',
                 'outtmpl': str(temp_file),
-                'quiet': False,
             }
+            ydl_opts.update(self._js_runtime_options())
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([self.stream_url])
 
@@ -434,6 +452,7 @@ class VideoThread(QThread):
         self.frame_buf = None
         self._last_stats = {'total_objects': 0, 'class_counts': {}}
         self.shared_frame_store = None
+        self._last_signal_emit_ts = 0.0
         
     def set_source(self, source):
         self.source = source
@@ -442,7 +461,8 @@ class VideoThread(QThread):
         self.processor = processor
         
     def set_params(self, frame_skip, resize_scale, output_fps_limit=None):
-        self.frame_skip = frame_skip
+        # Strict realtime: never skip frames in processing thread.
+        self.frame_skip = 0
         self.resize_scale = resize_scale
         if output_fps_limit is not None:
             self.output_fps_limit = max(5, int(output_fps_limit))
@@ -454,240 +474,149 @@ class VideoThread(QThread):
         if self.shared_frame_store is None:
             return
         version = self.shared_frame_store.publish(frame, stats)
-        self.frame_ready.emit(version)
+        now = time.perf_counter()
+        # Coalesce cross-thread notifications to prevent Qt event-queue backlog.
+        if (now - self._last_signal_emit_ts) >= (1.0 / 60.0):
+            self._last_signal_emit_ts = now
+            self.frame_ready.emit(version)
         
     def stop(self):
         self.running = False
         
     def run(self):
-        """Main processing loop - OPTIMIZED FOR RTSP with FFMPEG"""
+        """Main processing loop — realtime-first, no pacing sleep in inference thread."""
         if not self.source or not self.processor:
             return
-            
+
         self.running = True
-        
-        # Detect if RTSP stream
+
         is_rtsp = isinstance(self.source, str) and self.source.startswith('rtsp://')
-        is_livestream = is_rtsp or (isinstance(self.source, str) and ('http' in self.source or 'https' in self.source))
-        use_latest_buffer = is_livestream
-        
-        # For RTSP, use FFMPEG backend with special flags
+        is_http = isinstance(self.source, str) and ('http' in self.source or 'https' in self.source)
+        is_livestream = is_rtsp or is_http
+        is_file = not is_livestream and isinstance(self.source, str)
+        is_webcam = isinstance(self.source, int) or (isinstance(self.source, str) and self.source.isdigit())
+
         if is_rtsp:
-            # Set environment variable for FFMPEG options
             os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;udp|fflags;nobuffer|flags;low_delay'
             cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
-            # Ultra-low latency settings
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)  # No buffering
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             cap.set(cv2.CAP_PROP_FPS, 30)
         else:
             cap = cv2.VideoCapture(self.source)
-            # Keep generic streams closer to real-time by minimizing capture buffering.
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1 if isinstance(self.source, str) else 3)
-            if isinstance(self.source, str) and ('http' in self.source or 'https' in self.source):
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
-        
+            if is_file:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+            else:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         if not cap.isOpened():
             print(f"Error: Cannot open source {self.source}")
             self.finished.emit()
             return
 
-        self.frame_buf = LatestFrameBuffer(cap) if use_latest_buffer else None
-            
-        frame_count = 0
+        # Strict timeline mode: read frames sequentially to avoid perceived fast-forward.
+        self.frame_buf = None
+
+        source_fps = cap.get(cv2.CAP_PROP_FPS)
+        if source_fps <= 0 or source_fps > 240:
+            source_fps = 30.0
+
+        # Strict realtime: disable skip/catch-up branches entirely.
+        self.frame_skip = 0
         skip_counter = 0
         last_processed_frame = None
         last_success_time = time.time()
         consecutive_failures = 0
-        source_frame_index = 0
-        winmm = None
-        highres_timer_enabled = False
-        if os.name == "nt":
-            try:
-                winmm = ctypes.WinDLL("winmm")
-                highres_timer_enabled = (winmm.timeBeginPeriod(1) == 0)
-            except Exception:
-                winmm = None
-                highres_timer_enabled = False
-        
-        # FRAME PACING: keep output on a fixed cadence to avoid bursty playback.
-        source_fps = cap.get(cv2.CAP_PROP_FPS)
-        if source_fps <= 0 or source_fps > 120:
-            source_fps = 30  # Default to 30 FPS
-        target_output_fps = min(float(source_fps), float(self.output_fps_limit))
-        if target_output_fps <= 0:
-            target_output_fps = 30.0
-        frame_interval = 1.0 / target_output_fps
-        next_emit_deadline = time.perf_counter()
-        
-        playback_clock_start = time.perf_counter()
+        frames_rendered = 0
+        target_display_interval = 1.0 / max(5.0, float(self.output_fps_limit))
+        forced_tracking_frames = 0
+        last_input_timestamp = 0.0
 
-        def pace_output():
-            """
-            Emit frames on a steady wall-clock cadence.
+        # Keep local-file playback at source speed and avoid catch-up fast-forward.
+        file_frame_interval = (1.0 / source_fps) if is_file and source_fps > 0 else 0.0
+        next_file_frame_due = time.perf_counter()
 
-            If processing falls behind, resume from "now" instead of trying
-            to catch up with a visible fast-forward jump.
-            """
-            nonlocal next_emit_deadline
+        processor_supports_async = hasattr(self.processor, 'process_frame_threaded')
+        supports_tracking_only = hasattr(self.processor, 'process_frame_tracking_only')
 
-            next_emit_deadline += frame_interval
-            now = time.perf_counter()
-
-            if now > next_emit_deadline + frame_interval:
-                next_emit_deadline = now
-                return
-
-            sleep_time = next_emit_deadline - now
-            if sleep_time > 0:
-                # Sleep most of the budget, then spin/yield for sub-ms precision.
-                coarse_sleep = sleep_time - 0.002
-                if coarse_sleep > 0:
-                    time.sleep(coarse_sleep)
-                while time.perf_counter() < next_emit_deadline:
-                    time.sleep(0)
-
-        def sync_file_source_to_clock():
-            """
-            Keep file playback at 1x. If processing falls behind, drop decoded
-            frames so the next rendered frame matches the media clock instead of
-            slowing the whole video down.
-            """
-            nonlocal source_frame_index, playback_clock_start
-
-            if is_livestream or source_fps <= 0 or self.frame_buf is not None:
-                return
-
-            elapsed = time.perf_counter() - playback_clock_start
-            target_frame_index = int(elapsed * source_fps)
-            frames_to_drop = max(0, target_frame_index - source_frame_index)
-            if frames_to_drop <= 0:
-                return
-
-            frames_to_drop = min(frames_to_drop, max(1, int(source_fps)))
-            dropped = 0
-            while dropped < frames_to_drop and cap.grab():
-                source_frame_index += 1
-                dropped += 1
-
-            # If decode could not keep up, realign the wall clock to the source.
-            if dropped == 0 and frames_to_drop > 0:
-                playback_clock_start = time.perf_counter() - (source_frame_index / source_fps)
-        
         try:
             while self.running:
-                processor_supports_async = hasattr(self.processor, 'process_frame_threaded')
-                supports_tracking_only = hasattr(self.processor, 'process_frame_tracking_only')
-                loop_lag = time.perf_counter() - next_emit_deadline
-
-                sync_file_source_to_clock()
+                if file_frame_interval > 0:
+                    now = time.perf_counter()
+                    if now < next_file_frame_due:
+                        time.sleep(min(0.01, next_file_frame_due - now))
+                        continue
 
                 frame_ts = 0.0
-                if self.frame_buf is None:
-                    # For direct capture, aggressively drop stale live frames.
-                    if is_rtsp:
-                        cap.grab()
-                    elif is_livestream and time.perf_counter() > (next_emit_deadline + frame_interval):
-                        cap.grab()
-                    ret, frame = cap.read()
-                    if ret:
-                        frame_ts = time.monotonic()
-                else:
-                    ret, frame, frame_ts = self.frame_buf.read()
-
+                ret, frame = cap.read()
                 if ret:
-                    source_frame_index += 1
-                    loop_lag = time.perf_counter() - next_emit_deadline
-                
+                    frame_ts = time.monotonic()
+
                 if not ret:
                     consecutive_failures += 1
                     time_since_last = time.time() - last_success_time
 
                     if (is_rtsp or is_livestream) and consecutive_failures == 1:
                         _reset_processor_tracking_state(self.processor)
-                    
-                    # For RTSP, reconnect faster
-                    if is_rtsp and consecutive_failures > 10 and time_since_last > 0.5:
-                        print(f"⚠️ RTSP connection issue, attempting reconnect...")
-                        if self.frame_buf is not None:
-                            self.frame_buf.release()
-                            self.frame_buf = None
-                        else:
-                            cap.release()
-                        time.sleep(0.5)
+
+                    if is_rtsp and consecutive_failures > 5 and time_since_last > 0.3:
+                        print("RTSP reconnecting...")
+                        cap.release()
+
+                        time.sleep(0.2)
                         os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;udp|fflags;nobuffer|flags;low_delay'
                         cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
-                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
-                        cap.set(cv2.CAP_PROP_FPS, 30)
-                        if use_latest_buffer and cap.isOpened():
-                            self.frame_buf = LatestFrameBuffer(cap)
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
                         consecutive_failures = 0
-                        
-                        # Reset tracker immediately on reconnect
                         _reset_processor_tracking_state(self.processor)
                         continue
-                    
-                    # Reset tracker faster - after 1 second of lag (not 5)
-                    if time_since_last > 1.0 and consecutive_failures > 10:
-                        print(f"⚠️ Lag detected ({time_since_last:.1f}s), resetting tracker...")
-                        _reset_processor_tracking_state(self.processor)
-                        last_success_time = time.time()
-                        consecutive_failures = 0
-                    
-                    # Don't show old frame when lagging - causes ghost boxes
-                    # if last_processed_frame is not None and consecutive_failures < 30:
-                    #     self.frame_ready.emit(last_processed_frame, {'total_objects': 0, 'class_counts': {}})
-                    
-                    time.sleep(0.005)  # Giảm từ 0.01 → 0.005 (nhanh hơn)
+
+                    if not is_rtsp and time_since_last > 2.0:
+                        break
+
+                    time.sleep(0.005)
                     continue
-                
+
                 consecutive_failures = 0
                 last_success_time = time.time()
-                frame_count += 1
+                last_input_timestamp = frame_ts
 
                 use_tracking_only = False
-
-                # Apply frame-skip before expensive processing
                 if self.frame_skip > 0 and not processor_supports_async:
                     skip_counter = (skip_counter + 1) % (self.frame_skip + 1)
                     if skip_counter != 0:
                         use_tracking_only = supports_tracking_only
                         if not use_tracking_only:
-                            # Never resend stale processed overlays; use latest raw frame
-                            # if tracker-only rendering is not available.
-                            self._publish_frame(frame, self._last_stats)
-                            pace_output()
+                            if last_processed_frame is None:
+                                self._publish_frame(frame, self._last_stats)
                             continue
 
-                # Keep playback at 1x even when full inference cannot keep up.
-                # When late, fall back to a cheap tracker-only overlay pass until
-                # the wall clock is back under control.
                 if (
-                    not processor_supports_async
+                    not use_tracking_only
+                    and not processor_supports_async
                     and supports_tracking_only
-                    and loop_lag > (frame_interval * 0.65)
+                    and forced_tracking_frames > 0
                 ):
                     use_tracking_only = True
-                
-                # OPTIMIZED: Process current frame directly (no buffer delay)
-                # Old buffer logic caused 2-3 frame delay
-                process_frame = frame
-                
+                    forced_tracking_frames -= 1
+
+                process_started = time.perf_counter()
                 try:
                     if use_tracking_only:
                         processed_frame, stats = self.processor.process_frame_tracking_only(
-                            process_frame,
+                            frame,
                             frame_timestamp=frame_ts
                         )
-                    elif hasattr(self.processor, 'process_frame_threaded'):
+                    elif processor_supports_async:
                         processed_frame, stats = self.processor.process_frame_threaded(
-                            process_frame,
+                            frame,
                             self.resize_scale,
                             self.max_det,
                             frame_timestamp=frame_ts
                         )
                     else:
                         processed_frame, stats = self.processor.process_frame(
-                            process_frame,
+                            frame,
                             self.resize_scale,
                             self.max_det,
                             frame_timestamp=frame_ts
@@ -695,38 +624,58 @@ class VideoThread(QThread):
                     
                     last_processed_frame = processed_frame
                     self._last_stats = stats
+                    frames_rendered += 1
                     self._publish_frame(processed_frame, stats)
-                    pace_output()
+                    process_duration = time.perf_counter() - process_started
+                    if not processor_supports_async and supports_tracking_only and not use_tracking_only:
+                        if process_duration > (target_display_interval * 1.25):
+                            extra_tracking = int(process_duration / target_display_interval) - 1
+                            forced_tracking_frames = max(
+                                forced_tracking_frames,
+                                min(6, max(1, extra_tracking))
+                            )
+                    if file_frame_interval > 0:
+                        # Strict pacing: do not "catch up" by bursting frames when behind.
+                        next_file_frame_due = time.perf_counter() + file_frame_interval
                 except TypeError:
-                    # Backward-compat for processors that don't accept frame_timestamp.
                     if use_tracking_only:
-                        processed_frame, stats = self.processor.process_frame_tracking_only(process_frame)
-                    elif hasattr(self.processor, 'process_frame_threaded'):
-                        processed_frame, stats = self.processor.process_frame_threaded(process_frame, self.resize_scale, self.max_det)
+                        processed_frame, stats = self.processor.process_frame_tracking_only(frame)
+                    elif processor_supports_async:
+                        processed_frame, stats = self.processor.process_frame_threaded(
+                            frame,
+                            self.resize_scale,
+                            self.max_det
+                        )
                     else:
-                        processed_frame, stats = self.processor.process_frame(process_frame, self.resize_scale, self.max_det)
+                        processed_frame, stats = self.processor.process_frame(
+                            frame,
+                            self.resize_scale,
+                            self.max_det
+                        )
 
                     last_processed_frame = processed_frame
                     self._last_stats = stats
+                    frames_rendered += 1
                     self._publish_frame(processed_frame, stats)
-                    pace_output()
+                    process_duration = time.perf_counter() - process_started
+                    if not processor_supports_async and supports_tracking_only and not use_tracking_only:
+                        if process_duration > (target_display_interval * 1.25):
+                            extra_tracking = int(process_duration / target_display_interval) - 1
+                            forced_tracking_frames = max(
+                                forced_tracking_frames,
+                                min(6, max(1, extra_tracking))
+                            )
+                    if file_frame_interval > 0:
+                        # Strict pacing: do not "catch up" by bursting frames when behind.
+                        next_file_frame_due = time.perf_counter() + file_frame_interval
                 except Exception as e:
-                    print(f"Error: {e}")
+                    print(f"Inference error: {e}")
                     import traceback
                     traceback.print_exc()
                     continue
-                
+
         finally:
-            if highres_timer_enabled and winmm is not None:
-                try:
-                    winmm.timeEndPeriod(1)
-                except Exception:
-                    pass
-            if self.frame_buf is not None:
-                self.frame_buf.release()
-                self.frame_buf = None
-            else:
-                cap.release()
+            cap.release()
             self.finished.emit()
 
 
@@ -769,6 +718,7 @@ class MainWindow(QMainWindow):
         self.video_source = None
         self.shared_frame_store = SharedFrameStore()
         self.pending_frame_version = 0
+        self.metrics_last_version = 0
         self.pending_display_frame = None
         self.pending_display_stats = {'total_objects': 0, 'class_counts': {}}
         self.pending_frame_dirty = False
@@ -776,7 +726,7 @@ class MainWindow(QMainWindow):
         self.settings_save_timer = QTimer(self)
         self.settings_save_timer.setSingleShot(True)
         self.settings_save_timer.timeout.connect(self.save_settings)
-        self.adaptive_fps = True
+        self.adaptive_fps = False
         self.last_adaptive_tune_time = 0.0
         self.adaptive_tune_cooldown = 6.0
         self.render_timer = QTimer(self)
@@ -1183,9 +1133,11 @@ class MainWindow(QMainWindow):
             "Ultra: highest FPS / lowest latency"
         )
         self.processing_mode_combo.currentIndexChanged.connect(self.on_processing_mode_changed)
+        self.processing_mode_combo.setCurrentIndex(0)
+        self.processing_mode_combo.setEnabled(False)
         perf_layout.addWidget(self.processing_mode_combo)
 
-        self.processing_mode_hint = QLabel("Ultra is recommended for livestreams. Standard is best when you need richer labels.")
+        self.processing_mode_hint = QLabel("Strict realtime mode: Standard processor is locked to avoid async burst/stutter artifacts.")
         self.processing_mode_hint.setObjectName("subtleInfo")
         self.processing_mode_hint.setWordWrap(True)
         perf_layout.addWidget(self.processing_mode_hint)
@@ -1242,10 +1194,10 @@ class MainWindow(QMainWindow):
         )
         perf_layout.addWidget(self.btn_smooth_toggle)
 
-        self.btn_adaptive_fps = QPushButton("Adaptive FPS Boost: ON")
+        self.btn_adaptive_fps = QPushButton("Adaptive FPS Boost: OFF")
         self.btn_adaptive_fps.setCheckable(True)
-        self.btn_adaptive_fps.setChecked(True)
-        self.btn_adaptive_fps.setStyleSheet("background-color: #1d4ed8; color: white;")
+        self.btn_adaptive_fps.setChecked(False)
+        self.btn_adaptive_fps.setStyleSheet("background-color: #64748b; color: white;")
         self.btn_adaptive_fps.setToolTip(
             "When live FPS drops, the app will step down frame skip and resize\n"
             "to keep latency low and output smooth."
@@ -1708,10 +1660,10 @@ class MainWindow(QMainWindow):
 
     def _set_processing_mode_flags(self, mode: str):
         """Set mutually-exclusive processing mode flags."""
-        mode = (mode or "standard").strip().lower()
-        self.use_threaded_mode = mode == "threaded"
-        self.use_optimized_mode = mode == "optimized"
-        self.use_ultra_mode = mode == "ultra"
+        # Strict realtime: lock to standard mode to avoid async queue bursts.
+        self.use_threaded_mode = False
+        self.use_optimized_mode = False
+        self.use_ultra_mode = False
 
     def _sync_processing_mode_buttons(self):
         """Sync processing mode selector, badges, and helper text."""
@@ -1744,16 +1696,13 @@ class MainWindow(QMainWindow):
         self._sync_processing_mode_buttons()
         self.schedule_settings_save()
 
-        current_mode = self._get_processing_mode()
-        if current_mode == "standard":
-            self.status_label.setText("Standard mode enabled")
-        else:
-            self.status_label.setText(f"{current_mode.title()} mode enabled (reloading...)")
+        current_mode = "standard"
+        self.status_label.setText("Standard mode enabled (strict realtime)")
 
         if trigger_reload:
             if self.video_thread and self.video_thread.isRunning():
                 self.pending_reload_models = True
-                self.auto_reload_if_running(reason=f"Switching to {current_mode.title()} mode...")
+                self.auto_reload_if_running(reason="Applying strict realtime standard mode...")
             else:
                 self.load_models()
 
@@ -1905,22 +1854,7 @@ class MainWindow(QMainWindow):
 
             gpu_backend_active = any("CUDA" in backend for backend in actual_backends)
             cpu_only_mode = not gpu_backend_active
-            selected_mode = self._get_processing_mode()
-
-            if selected_mode == "ultra":
-                from src.processing.video_processor_ultra import UltraVideoProcessor
-                self.processor = UltraVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
-            elif selected_mode == "optimized":
-                from src.processing.video_processor_optimized import VideoProcessorOptimized
-                self.processor = VideoProcessorOptimized(self.model_person, self.model_vehicle, self.tracker)
-            elif selected_mode == "threaded":
-                from src.processing.video_processor_threaded import ThreadedVideoProcessor
-                self.processor = ThreadedVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
-            elif cpu_only_mode:
-                from src.processing.video_processor_ultra import UltraVideoProcessor
-                self.processor = UltraVideoProcessor(self.model_person, self.model_vehicle, self.tracker)
-            else:
-                self.processor = VideoProcessor(self.model_person, self.model_vehicle, self.tracker)
+            self.processor = VideoProcessor(self.model_person, self.model_vehicle, self.tracker)
 
             self.processor.set_confidence(self.confidence_slider.value() / 100.0)
             if hasattr(self.processor, 'set_box_thickness'):
@@ -2501,9 +2435,8 @@ class MainWindow(QMainWindow):
 
     def on_processing_mode_changed(self, index):
         """Handle processing mode selection from combo box."""
-        mode = self.processing_mode_combo.itemData(index)
-        if mode:
-            self._apply_processing_mode(mode)
+        # Ignore user selection changes while strict realtime lock is active.
+        self._apply_processing_mode("standard")
 
     def on_max_det_changed(self, value):
         """Handle max detections change"""
@@ -2881,13 +2814,38 @@ class MainWindow(QMainWindow):
         if not self.video_source:
             self.status_label.setText("Select a video file, stream URL, or camera first")
             return
+
+        source_text = str(self.video_source).strip().lower()
+        is_live_source = (
+            source_text.startswith(("rtsp://", "http://", "https://"))
+            or source_text.isdigit()
+            or isinstance(self.video_source, int)
+        )
+
+        # DeepSORT can introduce periodic stalls on live streams due to embedder cost.
+        # Force SORT for strict real-time continuity.
+        if is_live_source and "DeepSORT" in self.tracker_combo.currentText():
+            self.tracker = initialize_tracker('SORT (Fast)')
+            if self.processor is not None:
+                self.processor.tracker = self.tracker
+            sort_index = self.tracker_combo.findText("SORT (Fast)")
+            if sort_index >= 0:
+                self.tracker_combo.blockSignals(True)
+                self.tracker_combo.setCurrentIndex(sort_index)
+                self.tracker_combo.blockSignals(False)
+            self.status_label.setText("Live source: auto-switched tracker to SORT for stable real-time")
             
         # Stop existing thread if running
         if self.video_thread and self.video_thread.isRunning():
             self.stop_processing()
             
         # Get parameters
-        frame_skip = self.frame_skip_slider.value()
+        frame_skip = 0
+        if self.frame_skip_slider.value() != 0:
+            self.frame_skip_slider.blockSignals(True)
+            self.frame_skip_slider.setValue(0)
+            self.frame_skip_slider.blockSignals(False)
+            self.frame_skip_label.setText("Skip: 0 frames")
         resize_text = self.resize_combo.currentText().split()[0]  # Get "100%" from "100% (Full)"
         resize_scale = int(resize_text.replace('%', ''))
         
@@ -2902,7 +2860,6 @@ class MainWindow(QMainWindow):
         self.video_thread.set_shared_frame_store(self.shared_frame_store)
         self.video_thread.max_det = self.max_det  # Pass max_det
         self.video_thread.smooth_mode = self.smooth_mode
-        self.video_thread.frame_ready.connect(self.update_frame)
         self.video_thread.finished.connect(self.on_processing_finished)
         
         # Update UI
@@ -2928,6 +2885,7 @@ class MainWindow(QMainWindow):
         self.last_stats_text = ""
         self.shared_frame_store.clear()
         self.pending_frame_version = 0
+        self.metrics_last_version = 0
         self.pending_display_frame = None
         self.pending_display_stats = {'total_objects': 0, 'class_counts': {}}
         self.pending_frame_dirty = False
@@ -2977,6 +2935,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Stopped")
         self.render_timer.stop()
         self.pending_frame_version = 0
+        self.metrics_last_version = 0
         self._refresh_runtime_overview()
 
     def _smooth_fps_value(self, current_value, sample_value):
@@ -3099,33 +3058,34 @@ class MainWindow(QMainWindow):
         self.pending_display_stats = stats
         self.pending_frame_dirty = True
 
-        # Update FPS/statistics based on processed-frame arrivals.
-        self.fps_counter += 1
+    def _render_latest_frame(self):
+        """Render the newest frame at a stable UI cadence."""
+        version, latest_frame, latest_stats = self.shared_frame_store.read()
+        if version > self.pending_frame_version and latest_frame is not None:
+            self.pending_frame_version = version
+            self.pending_display_frame = latest_frame
+            self.pending_display_stats = latest_stats
+            self.pending_frame_dirty = True
+
+        if version > self.metrics_last_version:
+            self.fps_counter += (version - self.metrics_last_version)
+            self.metrics_last_version = version
+
         elapsed = time.perf_counter() - self.fps_start_time
         if elapsed >= self.fps_sample_interval:
             now = time.perf_counter()
             self.current_detect_fps = self.fps_counter / elapsed
             self.current_fps = self._smooth_fps_value(self.current_fps, self.current_detect_fps)
 
-            # Add to history (ignore very low FPS from lag/model switch)
             if self.current_fps >= 5.0:
                 self.fps_history.append(self.current_fps)
                 if len(self.fps_history) > self.fps_history_max:
                     self.fps_history.pop(0)
 
-            # AUTO CLEANUP if FPS drops significantly (with cooldown)
-            if self._is_live_source() and len(self.fps_history) >= 6:
-                avg_fps = sum(self.fps_history) / len(self.fps_history)
-                low_fps_threshold = max(6.0, avg_fps * 0.55)
-                if self.current_fps < low_fps_threshold:
-                    since_last_cleanup = time.time() - self.last_auto_cleanup_time
-                    if since_last_cleanup >= self.auto_cleanup_cooldown:
-                        self.last_auto_cleanup_time = time.time()
-                        QTimer.singleShot(0, self.manual_cleanup)
-
-            self._maybe_adaptive_tune()
-            self._update_fps_summary(stats)
-            self._update_stats_panel(stats)
+            if self.adaptive_fps:
+                self._maybe_adaptive_tune()
+            self._update_fps_summary(self.pending_display_stats)
+            self._update_stats_panel(self.pending_display_stats)
 
             self.fps_counter = 0
             self.fps_start_time = time.perf_counter()
@@ -3134,8 +3094,6 @@ class MainWindow(QMainWindow):
                 self._refresh_runtime_overview()
                 self.last_runtime_refresh_time = now
 
-    def _render_latest_frame(self):
-        """Render the newest frame at a stable UI cadence."""
         if self.pending_display_frame is None:
             return
 
@@ -3367,7 +3325,7 @@ class MainWindow(QMainWindow):
             
             # Performance settings
             if 'frame_skip' in settings:
-                self.frame_skip_slider.setValue(settings['frame_skip'])
+                self.frame_skip_slider.setValue(0)
             
             if 'resize_scale' in settings:
                 index = self.resize_combo.findText(settings['resize_scale'])
@@ -3382,15 +3340,15 @@ class MainWindow(QMainWindow):
                     self.btn_smooth_toggle.blockSignals(False)
                     self.toggle_smooth_mode(self.smooth_mode, self.btn_smooth_toggle)
             if 'adaptive_fps' in settings and hasattr(self, 'btn_adaptive_fps'):
-                checked = bool(settings['adaptive_fps'])
+                # Force default OFF for strict real-time stability.
+                checked = False
                 self.btn_adaptive_fps.blockSignals(True)
                 self.btn_adaptive_fps.setChecked(checked)
                 self.btn_adaptive_fps.blockSignals(False)
                 self.toggle_adaptive_fps(checked)
 
             # Mutually-exclusive processing mode
-            saved_mode = settings.get('processing_mode', 'standard')
-            self._apply_processing_mode(saved_mode, trigger_reload=False)
+            self._apply_processing_mode('standard', trigger_reload=False)
             
             # Stream settings
             if 'stream_input' in settings and settings['stream_input']:

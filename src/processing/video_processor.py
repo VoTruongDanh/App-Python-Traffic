@@ -338,22 +338,7 @@ class VideoProcessor:
                 for old_id in trail_ids[:-20]:
                     del self.trails[old_id]
 
-        # Lightweight full GC less frequently to avoid frame spikes
-        if self.frame_counter % (self.cleanup_interval * 12) == 0:
-            import gc
-            gc.collect()
-        
-        # AGGRESSIVE: Full reset every 1000 frames
-        if self.frame_counter % 1000 == 0:
-            print(f"🔄 Auto-reset at frame {self.frame_counter}")
-            # Clear all trails
-            self.trails.clear()
-            # Reset tracker
-            if hasattr(self.tracker, 'tracks'):
-                self.tracker.tracks.clear()
-            # Force full GC
-            import gc
-            gc.collect()
+        # Avoid heavy GC/tracker hard resets in real-time path; they cause visible stalls.
         
         # Store original size
         orig_h, orig_w = frame.shape[:2]

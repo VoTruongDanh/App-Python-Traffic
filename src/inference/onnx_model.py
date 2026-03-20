@@ -21,7 +21,13 @@ import torch
 
 if ONNX_AVAILABLE and hasattr(ort, "preload_dlls"):
     try:
-        ort.preload_dlls()
+        # Torch already loads CUDA/cuDNN DLLs in this app startup path.
+        # Avoid forcing ORT CUDA DLL preload to prevent CUDA 12.x mismatch warnings.
+        ort.preload_dlls(cuda=False, cudnn=False)
+    except TypeError:
+        # Older ORT builds may not support keyword flags.
+        # Do not call the no-arg preload here, because it may trigger CUDA 12.x warnings.
+        pass
     except Exception as exc:
         print(f"[WARN] ONNX Runtime DLL preload skipped: {exc}")
 
