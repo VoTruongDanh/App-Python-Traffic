@@ -1,27 +1,56 @@
 {
   "model_choice": "Custom model...",
-  "custom_model_path": "D:/BaiTapSinhVien/DoAnKySu/UI/trainv4/yolo3v4.onnx",
+  "custom_model_path": "D:/BaiTapSinhVien/DoAnKySu/UI/model/yolov8v1.onnx",
   "tracker_choice": "SORT (Fast)",
-  "confidence": 70,
+  "confidence": 25,
   "box_thickness": 2,
   "font_size": 21,
   "font_thickness": 2,
   "display_point_mode": false,
   "trail_enabled": false,
-  "max_det": 99,
+  "max_det": 12,
   "tracker_age": 1,
   "frame_skip": 0,
   "resize_scale": "100% (Full Quality)",
   "smooth_mode": false,
   "processing_mode": "standard",
   "adaptive_fps": false,
-  "stream_input": "https://www.youtube.com/watch?v=1EiC9bvVGnk",
+  "stream_input": "rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/2701",
   "stream_quality": "1080p (Best Quality)",
-  "video_type": "\ud83d\udd34 Livestream",
+  "video_type": "\ud83c\udfa5 Regular Video (Stream)",
   "last_video_file_path": null,
   "roi_threshold": 50,
-  "roi_visible": false,
-  "roi_config": null,
+  "roi_visible": true,
+  "roi_config": {
+    "points": [
+      [
+        2954,
+        612
+      ],
+      [
+        2230,
+        1686
+      ],
+      [
+        2187,
+        1768
+      ],
+      [
+        20,
+        1772
+      ],
+      [
+        15,
+        555
+      ],
+      [
+        1706,
+        427
+      ]
+    ],
+    "threshold": 0.5,
+    "active": true
+  },
   "sidebar_visible": true,
-  "runtime_expanded": true
+  "runtime_expanded": false
 }

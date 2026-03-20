@@ -4,6 +4,7 @@ Sử dụng IOU overlap và velocity analysis
 """
 import numpy as np
 from typing import Dict, List, Tuple
+import math
 
 
 class PersonClassifier:
@@ -32,6 +33,13 @@ class PersonClassifier:
         
         # Track first classification for counting
         self.first_classification = {}  # {track_id: "Pedestrian" or "Rider"}
+
+        # Reuse recent results when the same track barely changes between frames.
+        # {track_id: (label, frame_num, (cx, cy, w, h), vehicle_count)}
+        self.last_result_cache = {}
+        self.cache_max_frame_gap = 2
+        self.cache_center_shift_px = 8.0
+        self.cache_size_ratio_tol = 0.12
         
     def classify_person(self, person_bbox: List[float], person_track_id: int, 
                        vehicle_bboxes: List[Tuple[List[float], int]], 
@@ -48,6 +56,16 @@ class PersonClassifier:
         Returns:
             "Pedestrian", "Rider", or "Driver"
         """
+        # Fast-path: reuse recent label if track geometry is almost unchanged.
+        cached = self._get_cached_classification(
+            person_bbox,
+            person_track_id,
+            vehicle_bboxes,
+            frame_num,
+        )
+        if cached is not None:
+            return cached
+
         # Get raw classification
         raw_classification = self._classify_raw(person_bbox, person_track_id, vehicle_bboxes, frame_num)
         
@@ -80,8 +98,63 @@ class PersonClassifier:
         # Store first classification for this track (for counting)
         if person_track_id not in self.first_classification:
             self.first_classification[person_track_id] = smoothed
+
+        self._update_cache(person_bbox, person_track_id, smoothed, vehicle_bboxes, frame_num)
         
         return smoothed
+
+    def _bbox_signature(self, bbox: List[float]) -> Tuple[float, float, float, float]:
+        x1, y1, x2, y2 = bbox
+        w = max(1.0, float(x2 - x1))
+        h = max(1.0, float(y2 - y1))
+        cx = float(x1 + x2) * 0.5
+        cy = float(y1 + y2) * 0.5
+        return cx, cy, w, h
+
+    def _get_cached_classification(
+        self,
+        person_bbox: List[float],
+        person_track_id: int,
+        vehicle_bboxes: List[Tuple[List[float], int]],
+        frame_num: int,
+    ):
+        cached = self.last_result_cache.get(person_track_id)
+        if cached is None:
+            return None
+
+        last_label, last_frame, (last_cx, last_cy, last_w, last_h), last_vehicle_count = cached
+        if (frame_num - last_frame) > self.cache_max_frame_gap:
+            return None
+
+        if last_vehicle_count != len(vehicle_bboxes):
+            return None
+
+        cx, cy, w, h = self._bbox_signature(person_bbox)
+        shift = math.hypot(cx - last_cx, cy - last_cy)
+        if shift > self.cache_center_shift_px:
+            return None
+
+        if abs((w / max(1.0, last_w)) - 1.0) > self.cache_size_ratio_tol:
+            return None
+        if abs((h / max(1.0, last_h)) - 1.0) > self.cache_size_ratio_tol:
+            return None
+
+        return last_label
+
+    def _update_cache(
+        self,
+        person_bbox: List[float],
+        person_track_id: int,
+        label: str,
+        vehicle_bboxes: List[Tuple[List[float], int]],
+        frame_num: int,
+    ):
+        self.last_result_cache[person_track_id] = (
+            label,
+            frame_num,
+            self._bbox_signature(person_bbox),
+            len(vehicle_bboxes),
+        )
     
     def _classify_raw(self, person_bbox: List[float], person_track_id: int,
                      vehicle_bboxes: List[Tuple[List[float], int]], 
@@ -197,7 +270,7 @@ class PersonClassifier:
         if not velocities:
             return None
         
-        return np.mean(velocities)
+        return sum(velocities) / len(velocities)
     
     def get_first_classification(self, track_id: int) -> str:
         """
@@ -232,3 +305,7 @@ class PersonClassifier:
         old_ids = set(self.first_classification.keys()) - active_track_ids
         for old_id in old_ids:
             del self.first_classification[old_id]
+
+        old_ids = set(self.last_result_cache.keys()) - active_track_ids
+        for old_id in old_ids:
+            del self.last_result_cache[old_id]

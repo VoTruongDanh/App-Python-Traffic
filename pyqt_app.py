@@ -2834,6 +2834,15 @@ class MainWindow(QMainWindow):
                 self.tracker_combo.setCurrentIndex(sort_index)
                 self.tracker_combo.blockSignals(False)
             self.status_label.setText("Live source: auto-switched tracker to SORT for stable real-time")
+
+        # Auto high-FPS preset for live sources (without reducing resolution).
+        if is_live_source:
+            if self.max_det_slider.value() > 12:
+                self.max_det_slider.blockSignals(True)
+                self.max_det_slider.setValue(12)
+                self.max_det_slider.blockSignals(False)
+                self.max_det = 12
+                self.max_det_label.setText("12 objects")
             
         # Stop existing thread if running
         if self.video_thread and self.video_thread.isRunning():

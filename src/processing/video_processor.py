@@ -101,6 +101,8 @@ class VideoProcessor:
         self.person_classifier = PersonClassifier(iou_threshold=0.3)
         # Per-frame cache to avoid duplicate person classification work
         self._frame_person_types = {}
+        self._label_size_cache: Dict[Tuple[str, float, int], Tuple[int, int]] = {}
+        self._label_size_cache_limit = 512
         self.last_stats_snapshot = {
             'active_objects': 0,
             'active_class_counts': {},
@@ -120,6 +122,7 @@ class VideoProcessor:
         self.unique_ids.clear()
         self.class_counts.clear()
         self.trails.clear()
+        self._label_size_cache.clear()
         self._last_det_ts = 0.0
         self.last_stats_snapshot = {
             'active_objects': 0,
@@ -433,6 +436,10 @@ class VideoProcessor:
         """Filter overlapping detections to reduce noise (OPTIMIZED)"""
         if len(detections) <= 1:
             return detections
+
+        # For small batches, this extra NMS step often costs more than it helps.
+        if len(detections) <= 8:
+            return detections
         
         # Sort by confidence (highest first)
         detections = sorted(detections, key=lambda x: x[1], reverse=True)
@@ -447,8 +454,17 @@ class VideoProcessor:
             # Check overlap with already accepted detections
             is_duplicate = False
             for accepted in filtered:
-                acc_bbox = accepted[0]
+                acc_bbox, _, acc_cls_id = accepted
+
+                # Skip cross-class suppression to preserve quality and reduce checks.
+                if cls_id != acc_cls_id:
+                    continue
+
                 acc_x1, acc_y1, acc_w, acc_h = acc_bbox
+
+                # Fast reject for non-overlapping boxes.
+                if (x1 + w) <= acc_x1 or (acc_x1 + acc_w) <= x1 or (y1 + h) <= acc_y1 or (acc_y1 + acc_h) <= y1:
+                    continue
                 
                 # Calculate IOU
                 xx1 = max(x1, acc_x1)
@@ -472,6 +488,18 @@ class VideoProcessor:
                 filtered.append(det)
         
         return filtered
+
+    def _get_label_size(self, label: str, font_scale: float, font_thickness: int) -> Tuple[int, int]:
+        key = (label, round(font_scale, 3), int(font_thickness))
+        cached = self._label_size_cache.get(key)
+        if cached is not None:
+            return cached
+
+        size, _ = cv2.getTextSize(label, config.FONT, font_scale, font_thickness)
+        if len(self._label_size_cache) >= self._label_size_cache_limit:
+            self._label_size_cache.clear()
+        self._label_size_cache[key] = size
+        return size
     
     def _draw_detections(self, frame: np.ndarray, tracks, det_ts: float = 0.0) -> np.ndarray:
         """
@@ -644,7 +672,7 @@ class VideoProcessor:
             font_scale = self.font_size / 20.0
             font_thickness = max(1, int(self.font_size / 10))
             
-            (label_w, label_h), _ = cv2.getTextSize(label, config.FONT, font_scale, font_thickness)
+            label_w, label_h = self._get_label_size(label, font_scale, font_thickness)
             
             cv2.rectangle(
                 frame,
