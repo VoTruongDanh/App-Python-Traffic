@@ -103,6 +103,8 @@ class VideoProcessor:
         self._frame_person_types = {}
         self._label_size_cache: Dict[Tuple[str, float, int], Tuple[int, int]] = {}
         self._label_size_cache_limit = 512
+        self.enable_motion_propagation = False
+        self.duplicate_iou_threshold = 0.55
         self.last_stats_snapshot = {
             'active_objects': 0,
             'active_class_counts': {},
@@ -139,6 +141,10 @@ class VideoProcessor:
             confidence: Giá trị confidence (0.0 - 1.0)
         """
         self.confidence = max(config.MIN_CONFIDENCE, min(config.MAX_CONFIDENCE, confidence))
+
+    def set_duplicate_iou_threshold(self, threshold: float):
+        """Set IOU threshold for duplicate-box suppression."""
+        self.duplicate_iou_threshold = max(0.3, min(0.9, float(threshold)))
     
     def set_box_thickness(self, thickness: int):
         """
@@ -432,13 +438,12 @@ class VideoProcessor:
         stats = self._build_stats_payload(tracks, update_totals=False)
         return processed_frame, stats
     
-    def _filter_overlapping_detections(self, detections, iou_threshold=0.7):
+    def _filter_overlapping_detections(self, detections, iou_threshold=None):
         """Filter overlapping detections to reduce noise (OPTIMIZED)"""
-        if len(detections) <= 1:
-            return detections
+        if iou_threshold is None:
+            iou_threshold = self.duplicate_iou_threshold
 
-        # For small batches, this extra NMS step often costs more than it helps.
-        if len(detections) <= 8:
+        if len(detections) <= 1:
             return detections
         
         # Sort by confidence (highest first)
@@ -532,7 +537,7 @@ class VideoProcessor:
             ))
 
         propagated_map = {}
-        if tracks_with_velocity:
+        if self.enable_motion_propagation and tracks_with_velocity:
             render_ts = time.monotonic()
             propagated = propagate_tracks(tracks_with_velocity, render_ts=render_ts, det_ts=det_ts)
             propagated_map = {

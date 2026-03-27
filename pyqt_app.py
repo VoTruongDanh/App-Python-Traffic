@@ -990,6 +990,21 @@ class MainWindow(QMainWindow):
         
         self.confidence_label = QLabel("0.50")
         detection_layout.addWidget(self.confidence_label)
+
+        detection_layout.addWidget(QLabel("Duplicate Box IOU Threshold:"))
+        self.duplicate_iou_slider = QSlider(Qt.Horizontal)
+        self.duplicate_iou_slider.setMinimum(30)
+        self.duplicate_iou_slider.setMaximum(90)
+        self.duplicate_iou_slider.setValue(55)
+        self.duplicate_iou_slider.setToolTip(
+            "Lower value removes more overlapping boxes (aggressive)\n"
+            "Higher value keeps more boxes (conservative)"
+        )
+        self.duplicate_iou_slider.valueChanged.connect(self.on_duplicate_iou_changed)
+        detection_layout.addWidget(self.duplicate_iou_slider)
+
+        self.duplicate_iou_label = QLabel("0.55")
+        detection_layout.addWidget(self.duplicate_iou_label)
         
         # Box thickness slider
         detection_layout.addWidget(QLabel("Box Thickness:"))
@@ -1857,6 +1872,8 @@ class MainWindow(QMainWindow):
             self.processor = VideoProcessor(self.model_person, self.model_vehicle, self.tracker)
 
             self.processor.set_confidence(self.confidence_slider.value() / 100.0)
+            if hasattr(self.processor, 'set_duplicate_iou_threshold'):
+                self.processor.set_duplicate_iou_threshold(self.duplicate_iou_slider.value() / 100.0)
             if hasattr(self.processor, 'set_box_thickness'):
                 self.processor.set_box_thickness(self.box_thickness_slider.value())
             if hasattr(self.processor, 'set_font_size'):
@@ -2347,6 +2364,14 @@ class MainWindow(QMainWindow):
         if self.processor:
             self.processor.set_confidence(conf)
         self.schedule_settings_save()
+
+    def on_duplicate_iou_changed(self, value):
+        """Handle duplicate box IOU threshold change."""
+        iou_threshold = value / 100.0
+        self.duplicate_iou_label.setText(f"{iou_threshold:.2f}")
+        if self.processor and hasattr(self.processor, 'set_duplicate_iou_threshold'):
+            self.processor.set_duplicate_iou_threshold(iou_threshold)
+        self.schedule_settings_save()
     
     def on_box_thickness_changed(self, value):
         """Handle box thickness change"""
@@ -2822,18 +2847,7 @@ class MainWindow(QMainWindow):
             or isinstance(self.video_source, int)
         )
 
-        # DeepSORT can introduce periodic stalls on live streams due to embedder cost.
-        # Force SORT for strict real-time continuity.
-        if is_live_source and "DeepSORT" in self.tracker_combo.currentText():
-            self.tracker = initialize_tracker('SORT (Fast)')
-            if self.processor is not None:
-                self.processor.tracker = self.tracker
-            sort_index = self.tracker_combo.findText("SORT (Fast)")
-            if sort_index >= 0:
-                self.tracker_combo.blockSignals(True)
-                self.tracker_combo.setCurrentIndex(sort_index)
-                self.tracker_combo.blockSignals(False)
-            self.status_label.setText("Live source: auto-switched tracker to SORT for stable real-time")
+        # Respect user tracker choice (including DeepSORT) on all sources.
 
         # Auto high-FPS preset for live sources (without reducing resolution).
         if is_live_source:
@@ -3200,6 +3214,7 @@ class MainWindow(QMainWindow):
             
             # Detection settings
             'confidence': self.confidence_slider.value(),
+            'duplicate_iou_threshold': self.duplicate_iou_slider.value(),
             'box_thickness': self.box_thickness_slider.value(),
             'font_size': self.font_size_slider.value(),
             'font_thickness': self.font_thickness_slider.value(),
@@ -3309,6 +3324,8 @@ class MainWindow(QMainWindow):
             # Detection settings
             if 'confidence' in settings:
                 self.confidence_slider.setValue(settings['confidence'])
+            if 'duplicate_iou_threshold' in settings and hasattr(self, 'duplicate_iou_slider'):
+                self.duplicate_iou_slider.setValue(settings['duplicate_iou_threshold'])
             if 'box_thickness' in settings:
                 self.box_thickness_slider.setValue(settings['box_thickness'])
             if 'font_size' in settings:

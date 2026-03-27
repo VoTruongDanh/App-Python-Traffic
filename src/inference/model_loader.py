@@ -357,32 +357,14 @@ def initialize_tracker(tracker_type='SORT (Fast)'):
     # Check GPU from config
     use_gpu = config.USE_GPU and torch.cuda.is_available()
 
-    # DeepSort on CPU is usually too slow for real-time. Auto fallback to fast tracker.
     if not use_gpu:
-        try:
-            from src.tracking.sort_tracker import SORTTracker
-            print("DeepSort on CPU -> fallback to SORT for FPS")
-            return SORTTracker(
-                max_age=1,
-                min_hits=2,
-                iou_threshold=0.15
-            )
-        except ImportError:
-            try:
-                from src.tracking.simple_tracker import SimpleTracker
-                print("DeepSort on CPU -> fallback to Simple tracker for FPS")
-                return SimpleTracker(
-                    max_age=config.TRACKER_MAX_AGE,
-                    iou_threshold=0.35
-                )
-            except ImportError:
-                print("Fast fallback tracker unavailable, using DeepSort CPU (slow)")
+        print("Using DeepSort on CPU (user-selected).")
 
     print("Using DeepSort tracker")
     tracker = DeepSort(
-        max_age=1,
-        n_init=2,
-        max_iou_distance=0.85,
+        max_age=max(5, int(getattr(config, 'TRACKER_MAX_AGE', 1))),
+        n_init=3,
+        max_iou_distance=0.7,
         max_cosine_distance=0.4,
         nn_budget=64,
         nms_max_overlap=config.TRACKER_NMS_MAX_OVERLAP,
