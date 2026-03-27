@@ -326,6 +326,21 @@ def initialize_tracker(tracker_type='SORT (Fast)'):
     """
     tracker_name = (tracker_type or '').lower()
 
+    if 'byte' in tracker_name:
+        try:
+            from src.tracking.byte_tracker import ByteTracker
+            print("✅ Using ByteTrack")
+            return ByteTracker(
+                max_age=max(5, int(getattr(config, 'TRACKER_MAX_AGE', 20))),
+                min_hits=2,
+                match_iou_threshold=0.25,
+                high_conf_threshold=0.5,
+                low_conf_threshold=0.15,
+            )
+        except ImportError as e:
+            print(f"⚠️  ByteTrack not available: {e}")
+            print("   Falling back to SORT...")
+
     if 'simple' in tracker_name:
         try:
             from src.tracking.simple_tracker import SimpleTracker

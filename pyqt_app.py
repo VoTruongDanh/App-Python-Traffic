@@ -12,15 +12,18 @@ import sys
 import threading
 import cv2
 import numpy as np
+import urllib.request
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QSlider, QComboBox,
                              QFileDialog, QLineEdit, QGroupBox, QGridLayout, QTextEdit,
                              QDialog, QProgressBar, QListWidget, QListWidgetItem, QToolButton,
-                             QScrollArea, QFrame, QSizePolicy, QOpenGLWidget)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect
+                             QScrollArea, QFrame, QSizePolicy, QOpenGLWidget, QStackedWidget,
+                             QMenu, QInputDialog, QCheckBox, QSplashScreen)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QSize
 from PyQt5.QtGui import (
     QImage, QPixmap, QFont, QPainter, QColor,
-    QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture
+    QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture, QIcon, QLinearGradient
 )
 import time
 from pathlib import Path
@@ -37,6 +40,79 @@ class AppState:
     best_model_choice = "None (Use base YOLO only)"
 
 app_state = AppState()
+
+
+class ModernSplashScreen(QSplashScreen):
+    """Beautiful splash screen with loading animation"""
+    
+    def __init__(self):
+        # Create splash pixmap
+        pixmap = QPixmap(600, 400)
+        pixmap.fill(Qt.transparent)
+        super().__init__(pixmap, Qt.WindowStaysOnTopHint)
+        
+        self.progress = 0
+        self.message = "Initializing..."
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        
+    def drawContents(self, painter):
+        """Custom paint for modern splash screen"""
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Background gradient
+        gradient = QLinearGradient(0, 0, 0, 400)
+        gradient.setColorAt(0, QColor(15, 23, 42))  # slate-900
+        gradient.setColorAt(1, QColor(30, 41, 59))  # slate-800
+        painter.fillRect(0, 0, 600, 400, gradient)
+        
+        # App title
+        painter.setPen(QColor(255, 255, 255))
+        painter.setFont(QFont("Segoe UI", 28, QFont.Bold))
+        painter.drawText(0, 80, 600, 60, Qt.AlignCenter, "🚗 Vehicle Tracking")
+        
+        # Subtitle
+        painter.setPen(QColor(148, 163, 184))  # slate-400
+        painter.setFont(QFont("Segoe UI", 12))
+        painter.drawText(0, 140, 600, 30, Qt.AlignCenter, "Real-time Object Detection & Counting")
+        
+        # Progress bar background
+        bar_x, bar_y = 100, 250
+        bar_width, bar_height = 400, 8
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(51, 65, 85))  # slate-700
+        painter.drawRoundedRect(bar_x, bar_y, bar_width, bar_height, 4, 4)
+        
+        # Progress bar fill
+        if self.progress > 0:
+            fill_width = int(bar_width * self.progress / 100)
+            gradient_bar = QLinearGradient(bar_x, bar_y, bar_x + fill_width, bar_y)
+            gradient_bar.setColorAt(0, QColor(34, 197, 94))  # green-500
+            gradient_bar.setColorAt(1, QColor(22, 163, 74))  # green-600
+            painter.setBrush(gradient_bar)
+            painter.drawRoundedRect(bar_x, bar_y, fill_width, bar_height, 4, 4)
+        
+        # Progress text
+        painter.setPen(QColor(226, 232, 240))  # slate-200
+        painter.setFont(QFont("Segoe UI", 10))
+        painter.drawText(0, 280, 600, 30, Qt.AlignCenter, f"{self.progress}%")
+        
+        # Status message
+        painter.setPen(QColor(148, 163, 184))  # slate-400
+        painter.setFont(QFont("Segoe UI", 9))
+        painter.drawText(0, 310, 600, 30, Qt.AlignCenter, self.message)
+        
+        # Version/footer
+        painter.setPen(QColor(100, 116, 139))  # slate-500
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.drawText(0, 360, 600, 30, Qt.AlignCenter, "Powered by YOLO • PyQt5 • OpenCV")
+    
+    def set_progress(self, value, message=""):
+        """Update progress and message"""
+        self.progress = min(100, max(0, value))
+        if message:
+            self.message = message
+        self.repaint()
+        QApplication.processEvents()
 
 
 class SharedFrameStore:
@@ -691,6 +767,7 @@ class MainWindow(QMainWindow):
         self.video_thread = None
         self.model_loader_thread = None
         self.stream_resolver_thread = None
+        self.pending_youtube_source = None
         self.processor = None
         self.model_person = None
         self.model_vehicle = None
@@ -715,7 +792,30 @@ class MainWindow(QMainWindow):
         self.runtime_refresh_interval = 2.0
         self.last_stats_text = ""
         self.last_fps_color = ""
+        self.last_alert_color = ""
+        self.vehicle_alert_limit = 20
+        self.vehicle_alert_scope = "ROI"
+        self.alert_yellow_ratio = 0.7
         self.video_source = None
+        self.source_profiles = []
+        self.source_profile_counter = 1
+        self.active_source_profile_id = None
+        self.source_preview_cache = {}
+        self.source_preview_meta = {}
+        self.preview_retry_after = {}
+        self.preview_width = 256
+        self.preview_height = 144
+        self.source_grid_columns = 5
+        self.source_tile_text_size = "Medium"
+        self.pin_active_source_first = True
+        self.admin_row_profile_ids = []
+        self.preview_load_queue = []
+        self.preview_load_pending = set()
+        self.preview_loader_timer = QTimer(self)
+        self.preview_loader_timer.setSingleShot(True)
+        self.preview_loader_timer.timeout.connect(self._process_preview_queue)
+        self.last_preview_capture_ts = 0.0
+        self.preview_capture_interval = 1.2
         self.shared_frame_store = SharedFrameStore()
         self.pending_frame_version = 0
         self.metrics_last_version = 0
@@ -794,12 +894,131 @@ class MainWindow(QMainWindow):
         title_row.addWidget(self.video_title_label)
         title_row.addStretch()
 
-        self.btn_toggle_sidebar = QPushButton("Hide Controls")
+        self.btn_toggle_sidebar = QPushButton("Mo Cau Hinh")
         self.btn_toggle_sidebar.setObjectName("secondaryAction")
         self.btn_toggle_sidebar.clicked.connect(self.toggle_sidebar)
         title_row.addWidget(self.btn_toggle_sidebar)
+
+        self.btn_show_admin = QPushButton("Quan Ly Nguon")
+        self.btn_show_admin.setObjectName("secondaryAction")
+        self.btn_show_admin.clicked.connect(self.show_admin_dashboard)
+        title_row.addWidget(self.btn_show_admin)
         left_panel.addLayout(title_row)
         
+        # Main content stack: admin dashboard (default) + large player view
+        self.main_view_stack = QStackedWidget()
+        self.main_view_stack.setObjectName("mainViewStack")
+
+        admin_page = QWidget()
+        admin_layout = QVBoxLayout(admin_page)
+        admin_layout.setContentsMargins(10, 10, 10, 10)
+        admin_layout.setSpacing(10)
+
+        self.admin_heading_label = QLabel("Quan Ly Nguon Camera")
+        self.admin_heading_label.setObjectName("videoTitle")
+        admin_layout.addWidget(self.admin_heading_label)
+
+        self.admin_subtitle_label = QLabel("Dat ten de phan loai nguon nhanh hon. Chon tile de mo player lon.")
+        self.admin_subtitle_label.setObjectName("subtleInfo")
+        self.admin_subtitle_label.setWordWrap(True)
+        admin_layout.addWidget(self.admin_subtitle_label)
+
+        admin_name_row = QHBoxLayout()
+        self.admin_name_input = QLineEdit()
+        self.admin_name_input.setPlaceholderText("Ten hien thi (vi du: Cong 1, Tang 2)")
+        admin_name_row.addWidget(self.admin_name_input)
+
+        self.btn_admin_rename_source = QPushButton("Luu Ten")
+        self.btn_admin_rename_source.setObjectName("secondaryAction")
+        self.btn_admin_rename_source.clicked.connect(self.rename_selected_admin_source)
+        self.btn_admin_rename_source.setEnabled(False)
+        admin_name_row.addWidget(self.btn_admin_rename_source)
+        admin_layout.addLayout(admin_name_row)
+
+        admin_input_row = QHBoxLayout()
+        self.admin_source_input = QLineEdit()
+        self.admin_source_input.setPlaceholderText("rtsp://..., https://..., youtube url or camera id")
+        admin_input_row.addWidget(self.admin_source_input)
+
+        self.btn_admin_add_url = QPushButton("Them URL/Cam")
+        self.btn_admin_add_url.clicked.connect(self.add_admin_source_from_input)
+        admin_input_row.addWidget(self.btn_admin_add_url)
+
+        self.btn_admin_add_file = QPushButton("Them File")
+        self.btn_admin_add_file.setObjectName("secondaryAction")
+        self.btn_admin_add_file.clicked.connect(self.add_admin_source_from_file)
+        admin_input_row.addWidget(self.btn_admin_add_file)
+        admin_layout.addLayout(admin_input_row)
+
+        admin_grid_row = QHBoxLayout()
+        admin_grid_row.addWidget(QLabel("Nguon / hang:"))
+        self.source_grid_combo = QComboBox()
+        self.source_grid_combo.addItems(["2", "3", "4", "5", "6", "7"])
+        self.source_grid_combo.setCurrentText(str(self.source_grid_columns))
+        self.source_grid_combo.currentTextChanged.connect(self.on_source_grid_columns_changed)
+        admin_grid_row.addWidget(self.source_grid_combo)
+
+        admin_grid_row.addWidget(QLabel("Chu:"))
+        self.source_text_size_combo = QComboBox()
+        self.source_text_size_combo.addItems(["Small", "Medium", "Large"])
+        self.source_text_size_combo.setCurrentText(self.source_tile_text_size)
+        self.source_text_size_combo.currentTextChanged.connect(self.on_source_text_size_changed)
+        admin_grid_row.addWidget(self.source_text_size_combo)
+
+        self.pin_active_checkbox = QCheckBox("Ghim ACTIVE dau hang")
+        self.pin_active_checkbox.setChecked(self.pin_active_source_first)
+        self.pin_active_checkbox.toggled.connect(self.on_pin_active_source_changed)
+        admin_grid_row.addWidget(self.pin_active_checkbox)
+        admin_grid_row.addStretch()
+        admin_layout.addLayout(admin_grid_row)
+
+        self.admin_source_list = QListWidget()
+        self.admin_source_list.setObjectName("adminSourceList")
+        self.admin_source_list.setMinimumHeight(320)
+        self.admin_source_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.admin_source_list.setViewMode(QListWidget.IconMode)
+        self.admin_source_list.setIconSize(QSize(self.preview_width, self.preview_height))
+        self.admin_source_list.setGridSize(QSize(self.preview_width + 42, self.preview_height + 104))
+        self.admin_source_list.setResizeMode(QListWidget.Adjust)
+        self.admin_source_list.setMovement(QListWidget.Static)
+        self.admin_source_list.setUniformItemSizes(True)
+        self.admin_source_list.setSpacing(10)
+        self.admin_source_list.setWrapping(True)
+        self.admin_source_list.setWordWrap(False)
+        self.admin_source_list.setTextElideMode(Qt.ElideRight)
+        self.admin_source_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.admin_source_list.currentRowChanged.connect(self.on_admin_source_selected)
+        self.admin_source_list.customContextMenuRequested.connect(self.show_admin_source_context_menu)
+        self.admin_source_list.itemDoubleClicked.connect(lambda _: self.open_selected_admin_source())
+        self.admin_source_list.itemActivated.connect(lambda _: self.open_selected_admin_source())
+        admin_layout.addWidget(self.admin_source_list, 1)
+
+        admin_btn_row = QHBoxLayout()
+        self.btn_admin_open_source = QPushButton("Mo Man Hinh Lon")
+        self.btn_admin_open_source.setObjectName("primaryAction")
+        self.btn_admin_open_source.clicked.connect(self.open_selected_admin_source)
+        self.btn_admin_open_source.setEnabled(False)
+        admin_btn_row.addWidget(self.btn_admin_open_source)
+
+        self.btn_admin_delete_source = QPushButton("Xoa Nguon")
+        self.btn_admin_delete_source.setObjectName("dangerAction")
+        self.btn_admin_delete_source.clicked.connect(self.delete_selected_admin_source)
+        self.btn_admin_delete_source.setEnabled(False)
+        admin_btn_row.addWidget(self.btn_admin_delete_source)
+
+        self.btn_admin_refresh_sources = QPushButton("Lam Moi Preview")
+        self.btn_admin_refresh_sources.setObjectName("secondaryAction")
+        self.btn_admin_refresh_sources.clicked.connect(self.refresh_admin_source_previews)
+        admin_btn_row.addWidget(self.btn_admin_refresh_sources)
+        admin_layout.addLayout(admin_btn_row)
+
+        self._apply_admin_source_grid_columns(refresh_cards=False)
+
+        player_page = QWidget()
+        player_layout = QVBoxLayout(player_page)
+        player_layout.setContentsMargins(0, 0, 0, 0)
+        player_layout.setSpacing(0)
+
         # Video display label
         self.video_label = VideoOpenGLWidget()
         self.video_label.setObjectName("videoSurface")
@@ -811,16 +1030,14 @@ class MainWindow(QMainWindow):
         self.video_label.setText("Load video or livestream to begin")
         self.video_label.setMouseTracking(True)
         self.video_label.mousePressEvent = self.on_video_label_click
-        left_panel.addWidget(self.video_label)
+        player_layout.addWidget(self.video_label)
+
+        self.main_view_stack.addWidget(admin_page)
+        self.main_view_stack.addWidget(player_page)
+        left_panel.addWidget(self.main_view_stack)
         
-        # FPS display
-        self.fps_label = QLabel("Display FPS: 0.0 | Process FPS: 0.0")
-        self.fps_label.setObjectName("fpsBadge")
-        self.fps_label.setFont(QFont("Segoe UI", 14, QFont.Bold))
-        self.fps_label.setWordWrap(True)
-        self.fps_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.fps_label.setMinimumHeight(112)
-        left_panel.addWidget(self.fps_label)
+        # New Consolidated Status Dashboard
+        self._setup_status_panel(left_panel)
         
         # Control buttons
         button_layout = QHBoxLayout()
@@ -963,10 +1180,11 @@ class MainWindow(QMainWindow):
         
         model_layout.addWidget(QLabel("Tracking Mode:"))
         self.tracker_combo = QComboBox()
-        self.tracker_combo.addItems(["SORT (Fast)", "DeepSORT (Stable)"])
+        self.tracker_combo.addItems(["SORT (Fast)", "ByteTrack (Balanced)", "DeepSORT (Stable)"])
         self.tracker_combo.setCurrentIndex(0)
         self.tracker_combo.setToolTip(
             "SORT: faster tracking and lighter CPU/GPU load\n"
+            "ByteTrack: keeps IDs stable in crowded scenes with moderate cost\n"
             "DeepSORT: more stable IDs, slower than SORT"
         )
         self.tracker_combo.currentTextChanged.connect(self.on_tracker_changed)
@@ -1092,6 +1310,26 @@ class MainWindow(QMainWindow):
         
         self.tracker_age_label = QLabel("1 frame")
         detection_layout.addWidget(self.tracker_age_label)
+
+        detection_layout.addWidget(QLabel("Vehicle Alert Scope (Auto):"))
+        self.vehicle_alert_scope_combo = QComboBox()
+        self.vehicle_alert_scope_combo.addItems(["Auto (ROI if available)"])
+        self.vehicle_alert_scope_combo.setCurrentIndex(0)
+        self.vehicle_alert_scope_combo.setEnabled(False)
+        self.vehicle_alert_scope_combo.setToolTip("Tu dong: neu co ROI active thi canh bao theo ROI, neu khong thi theo toan bo khung hinh")
+        detection_layout.addWidget(self.vehicle_alert_scope_combo)
+
+        detection_layout.addWidget(QLabel("Vehicle Alert Limit:"))
+        self.vehicle_alert_limit_slider = QSlider(Qt.Horizontal)
+        self.vehicle_alert_limit_slider.setMinimum(1)
+        self.vehicle_alert_limit_slider.setMaximum(200)
+        self.vehicle_alert_limit_slider.setValue(self.vehicle_alert_limit)
+        self.vehicle_alert_limit_slider.setToolTip("Nguong canh bao: >100% do, >=70% vang, thap hon la xanh")
+        self.vehicle_alert_limit_slider.valueChanged.connect(self.on_vehicle_alert_limit_changed)
+        detection_layout.addWidget(self.vehicle_alert_limit_slider)
+
+        self.vehicle_alert_limit_label = QLabel(f"{self.vehicle_alert_limit} vehicles")
+        detection_layout.addWidget(self.vehicle_alert_limit_label)
         
         detection_group.setLayout(detection_layout)
         right_panel.addWidget(detection_group)
@@ -1226,6 +1464,7 @@ class MainWindow(QMainWindow):
         # Video source
         stream_group = QGroupBox("Video Source")
         self.stream_group = stream_group
+        self.stream_group = stream_group
         stream_layout = QVBoxLayout()
 
         source_hint = QLabel("Open a local file or paste a YouTube, RTSP, HTTP stream, or webcam ID.")
@@ -1292,6 +1531,50 @@ class MainWindow(QMainWindow):
         
         stream_group.setLayout(stream_layout)
         right_panel.addWidget(stream_group)
+
+        # Source admin hub
+        source_hub_group = QGroupBox("Source Admin Hub")
+        self.source_hub_group = source_hub_group
+        source_hub_layout = QVBoxLayout()
+
+        hub_hint = QLabel("Manage multiple sources. Select one source and open it in the large player.")
+        hub_hint.setObjectName("subtleInfo")
+        hub_hint.setWordWrap(True)
+        source_hub_layout.addWidget(hub_hint)
+
+        self.source_list_widget = QListWidget()
+        self.source_list_widget.setMinimumHeight(140)
+        self.source_list_widget.currentRowChanged.connect(self.on_source_profile_selected)
+        source_hub_layout.addWidget(self.source_list_widget)
+
+        hub_btn_row_1 = QHBoxLayout()
+        self.btn_add_current_source = QPushButton("Add Current")
+        self.btn_add_current_source.clicked.connect(self.add_current_source_profile)
+        hub_btn_row_1.addWidget(self.btn_add_current_source)
+
+        self.btn_open_selected_source = QPushButton("Open Selected")
+        self.btn_open_selected_source.setObjectName("primaryAction")
+        self.btn_open_selected_source.clicked.connect(self.open_selected_source_profile)
+        hub_btn_row_1.addWidget(self.btn_open_selected_source)
+        source_hub_layout.addLayout(hub_btn_row_1)
+
+        hub_btn_row_2 = QHBoxLayout()
+        self.btn_update_source_profile = QPushButton("Update Profile")
+        self.btn_update_source_profile.clicked.connect(self.update_selected_source_profile)
+        hub_btn_row_2.addWidget(self.btn_update_source_profile)
+
+        self.btn_remove_source_profile = QPushButton("Remove")
+        self.btn_remove_source_profile.setObjectName("dangerAction")
+        self.btn_remove_source_profile.clicked.connect(self.remove_selected_source_profile)
+        hub_btn_row_2.addWidget(self.btn_remove_source_profile)
+        source_hub_layout.addLayout(hub_btn_row_2)
+
+        self.source_profile_status = QLabel("No source profiles yet")
+        self.source_profile_status.setObjectName("subtleInfo")
+        source_hub_layout.addWidget(self.source_profile_status)
+
+        source_hub_group.setLayout(source_hub_layout)
+        right_panel.addWidget(source_hub_group)
         
         # ROI Settings
         roi_group = QGroupBox("ROI (Region of Interest)")
@@ -1396,6 +1679,7 @@ class MainWindow(QMainWindow):
 
         ordered_widgets = [
             self.stream_group,
+            self.source_hub_group,
             self.runtime_shell,
             self.model_group,
             self.perf_group,
@@ -1460,6 +1744,8 @@ class MainWindow(QMainWindow):
         self.apply_theme()
         self._refresh_custom_model_input()
         self._sync_processing_mode_buttons()
+        self.refresh_admin_source_cards()
+        self.show_admin_dashboard()
 
     def apply_theme(self):
         """Apply cohesive UI theme for better readability and hierarchy."""
@@ -1643,6 +1929,25 @@ class MainWindow(QMainWindow):
                 background: #fffdf8;
                 selection-background-color: #d97706;
                 selection-color: white;
+            }
+            QListWidget#adminSourceList {
+                background: #f7f1e7;
+                border: 1px solid #d7cab9;
+                border-radius: 14px;
+                padding: 8px;
+                outline: none;
+            }
+            QListWidget#adminSourceList::item {
+                background: #fffdf8;
+                border: 1px solid #d9ccb8;
+                border-radius: 12px;
+                padding: 6px;
+                margin: 4px;
+            }
+            QListWidget#adminSourceList::item:selected {
+                background: #e6f4ff;
+                border: 2px solid #0284c7;
+                color: #0c4a6e;
             }
             QSlider::groove:horizontal {
                 border: 1px solid #dfd2c2;
@@ -2050,7 +2355,7 @@ class MainWindow(QMainWindow):
         """Show or hide the right-side control panel."""
         visible = not self.scroll_area.isVisible()
         self.scroll_area.setVisible(visible)
-        self.btn_toggle_sidebar.setText("Hide Controls" if visible else "Show Controls")
+        self.btn_toggle_sidebar.setText("An Cau Hinh" if visible else "Mo Cau Hinh")
         self.schedule_settings_save()
 
     def toggle_runtime_section(self):
@@ -2276,6 +2581,12 @@ class MainWindow(QMainWindow):
 
     def on_model_changed(self, model_name):
         """Handle model selection change"""
+        if getattr(self, 'settings_loading', False):
+            # Ignore startup restore events to avoid auto-opening custom model dialog.
+            self.last_model_selection = model_name
+            self._refresh_custom_model_input()
+            return
+
         try:
             if model_name == "Custom model...":
                 QTimer.singleShot(0, self.browse_custom_model)
@@ -2753,6 +3064,11 @@ class MainWindow(QMainWindow):
             
     def load_video_file(self):
         """Load video file"""
+        if hasattr(self, 'main_view_stack') and self.main_view_stack.currentIndex() != 0:
+            self.status_label.setText("Open Source Page to add new sources")
+            self.show_admin_dashboard()
+            return
+
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Video File", "", 
             "Video Files (*.mp4 *.avi *.mov *.mkv *.webm)"
@@ -2760,6 +3076,7 @@ class MainWindow(QMainWindow):
         
         if file_path:
             self.video_source = file_path
+            self._upsert_source_profile(file_path, source_type="file", auto_select=True)
             self.status_label.setText(f"Loaded: {Path(file_path).name}")
             self.btn_start.setEnabled(True)
             self._refresh_runtime_overview()
@@ -2767,6 +3084,11 @@ class MainWindow(QMainWindow):
             
     def start_livestream(self):
         """Start livestream processing"""
+        if hasattr(self, 'main_view_stack') and self.main_view_stack.currentIndex() != 0:
+            self.status_label.setText("Open Source Page to add new sources")
+            self.show_admin_dashboard()
+            return
+
         stream_url = self.stream_input.currentText().strip()
         
         if not stream_url:
@@ -2780,28 +3102,17 @@ class MainWindow(QMainWindow):
         # Check if webcam ID
         if stream_url.isdigit():
             self.video_source = int(stream_url)
+            self._upsert_source_profile(self.video_source, source_type="camera", auto_select=True)
         else:
             # Handle YouTube URL  
             if 'youtube.com' in stream_url or 'youtu.be' in stream_url:
-                if self.stream_resolver_thread and self.stream_resolver_thread.isRunning():
-                    self.status_label.setText("YouTube source is already being resolved...")
-                    return
-
-                self.btn_start_stream.setEnabled(False)
-                self.btn_start.setEnabled(False)
-                self.status_label.setText("🔄 Checking YouTube URL...")
-                self.stream_resolver_thread = StreamResolveThread(
-                    stream_url,
-                    self.stream_quality_combo.currentText()
-                )
-                self.stream_resolver_thread.progress.connect(self._on_stream_resolve_progress)
-                self.stream_resolver_thread.resolved.connect(self._on_stream_resolved)
-                self.stream_resolver_thread.failed.connect(self._on_stream_resolve_failed)
-                self.stream_resolver_thread.finished.connect(self._on_stream_resolve_finished)
-                self.stream_resolver_thread.start()
+                self._upsert_source_profile(stream_url, source_type="youtube", auto_select=True)
+                self._start_youtube_resolve(stream_url)
                 return
             else:
                 self.video_source = stream_url
+                source_type = "rtsp" if stream_url.lower().startswith("rtsp://") else "stream"
+                self._upsert_source_profile(self.video_source, source_type=source_type, auto_select=True)
                 self._refresh_runtime_overview()
                 
         self.start_processing()
@@ -2812,6 +3123,8 @@ class MainWindow(QMainWindow):
 
     def _on_stream_resolved(self, resolved_source, status_text: str):
         self.video_source = resolved_source
+        if self.pending_youtube_source:
+            self._upsert_source_profile(self.pending_youtube_source, source_type="youtube", auto_select=True)
         self.status_label.setText(status_text)
         self._refresh_runtime_overview()
         self.start_processing()
@@ -2821,11 +3134,32 @@ class MainWindow(QMainWindow):
         print(f"Full error: {error_text}")
 
     def _on_stream_resolve_finished(self):
+        self.pending_youtube_source = None
         self.btn_start_stream.setEnabled(not self.models_loading)
         self.btn_start.setEnabled((not self.models_loading) and bool(self.video_source) and bool(self.processor))
         if self.stream_resolver_thread:
             self.stream_resolver_thread.deleteLater()
             self.stream_resolver_thread = None
+
+    def _start_youtube_resolve(self, youtube_url: str):
+        if self.stream_resolver_thread and self.stream_resolver_thread.isRunning():
+            self.status_label.setText("YouTube source is already being resolved...")
+            return False
+
+        self.pending_youtube_source = youtube_url
+        self.btn_start_stream.setEnabled(False)
+        self.btn_start.setEnabled(False)
+        self.status_label.setText("🔄 Checking YouTube URL...")
+        self.stream_resolver_thread = StreamResolveThread(
+            youtube_url,
+            self.stream_quality_combo.currentText()
+        )
+        self.stream_resolver_thread.progress.connect(self._on_stream_resolve_progress)
+        self.stream_resolver_thread.resolved.connect(self._on_stream_resolved)
+        self.stream_resolver_thread.failed.connect(self._on_stream_resolve_failed)
+        self.stream_resolver_thread.finished.connect(self._on_stream_resolve_finished)
+        self.stream_resolver_thread.start()
+        return True
         
     def start_processing(self):
         """Start video processing"""
@@ -2839,6 +3173,14 @@ class MainWindow(QMainWindow):
         if not self.video_source:
             self.status_label.setText("Select a video file, stream URL, or camera first")
             return
+
+        if isinstance(self.video_source, str):
+            source_text = self.video_source.strip().lower()
+            if ('youtube.com' in source_text) or ('youtu.be' in source_text):
+                self._start_youtube_resolve(self.video_source)
+                return
+
+        self.show_player_view()
 
         source_text = str(self.video_source).strip().lower()
         is_live_source = (
@@ -2912,12 +3254,14 @@ class MainWindow(QMainWindow):
         self.pending_display_frame = None
         self.pending_display_stats = {'total_objects': 0, 'class_counts': {}}
         self.pending_frame_dirty = False
+        self.last_preview_capture_ts = 0.0
         if hasattr(self.video_label, 'clear_frame'):
             self.video_label.clear_frame()
         self.video_thread.start()
         self.render_timer.start()
         self._update_fps_summary(self.pending_display_stats)
         self._update_stats_panel(self.pending_display_stats)
+        self._update_vehicle_alert_ui(self.pending_display_stats)
         self._refresh_runtime_overview()
         
     def stop_processing(self, preserve_pending=False):
@@ -2959,6 +3303,7 @@ class MainWindow(QMainWindow):
         self.render_timer.stop()
         self.pending_frame_version = 0
         self.metrics_last_version = 0
+        self._update_vehicle_alert_ui({'active_class_counts': {}, 'class_counts': {}})
         self._refresh_runtime_overview()
 
     def _smooth_fps_value(self, current_value, sample_value):
@@ -2986,47 +3331,412 @@ class MainWindow(QMainWindow):
             lines.append(f"  {cls_name:<{name_width}} {count:>4}")
         return "\n".join(lines)
 
-    def _set_fps_badge_color(self, fps_value):
-        """Color the FPS badge based on the slower visible rate."""
-        if fps_value >= 20:
-            color = '#22c55e'
-        elif fps_value >= 10:
-            color = '#f59e0b'
-        else:
-            color = '#ef4444'
+    def _setup_status_panel(self, parent_layout):
+        """Realtime Status Panel - 9 Column Layout: 1 FPS + 7 Object Classes + 1 Total"""
+        panel = QFrame()
+        self.status_panel = panel
+        panel.setObjectName("statusPanel")
+        panel.setStyleSheet(
+            "QFrame#statusPanel {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f8fafc, stop:1 #f1f5f9);"
+            "  border: 2px solid #cbd5e1;"
+            "  border-radius: 16px;"
+            "}"
+        )
 
-        if color == self.last_fps_color:
-            return
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(16, 14, 16, 14)
+        panel_layout.setSpacing(12)
 
-        self.fps_label.setStyleSheet(
-            "color: {color};"
-            "background: #fff7ed;"
-            "border: 1px solid #f0b47a;"
-            "border-radius: 14px;"
-            "padding: 12px 16px;"
-            "font-size: 15px;"
+        # ========== HEADER: Title + Status Badge ==========
+        header_row = QHBoxLayout()
+        header_row.setSpacing(10)
+        
+        title = QLabel("📊 Realtime Status")
+        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        title.setStyleSheet("color: #1e293b;")
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+
+        self.status_level_badge = QLabel("AN TOAN")
+        self.status_level_badge.setAlignment(Qt.AlignCenter)
+        self.status_level_badge.setMinimumWidth(200)
+        self.status_level_badge.setStyleSheet(
+            "background: #22c55e;"
+            "color: #ffffff;"
+            "border-radius: 12px;"
+            "padding: 8px 16px;"
             "font-weight: 700;"
-        .format(color=color))
-        self.last_fps_color = color
+            "font-size: 12px;"
+            "letter-spacing: 0.5px;"
+        )
+        header_row.addWidget(self.status_level_badge)
+        panel_layout.addLayout(header_row)
+
+        # ========== MAIN METRICS - 8 Columns Grid ==========
+        metrics_container = QFrame()
+        metrics_container.setStyleSheet(
+            "background: #ffffff;"
+            "border: 1px solid #e2e8f0;"
+            "border-radius: 10px;"
+            "padding: 10px;"
+        )
+        metrics_layout = QGridLayout(metrics_container)
+        metrics_layout.setContentsMargins(6, 8, 6, 8)
+        metrics_layout.setHorizontalSpacing(8)
+        metrics_layout.setVerticalSpacing(6)
+        
+        # ========== Column 0: FPS ==========
+        fps_title = QLabel("⚡ FPS")
+        fps_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        fps_title.setStyleSheet("color: #64748b;")
+        fps_title.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(fps_title, 0, 0)
+        
+        self.status_main_fps = QLabel("0.0")
+        self.status_main_fps.setFont(QFont("Segoe UI", 20, QFont.Bold))
+        self.status_main_fps.setStyleSheet("color: #22c55e;")
+        self.status_main_fps.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_main_fps, 1, 0)
+        
+        fps_subtitle = QLabel("Display")
+        fps_subtitle.setFont(QFont("Segoe UI", 7, QFont.Normal))
+        fps_subtitle.setStyleSheet("color: #94a3b8;")
+        fps_subtitle.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(fps_subtitle, 2, 0)
+        
+        # ========== Column 1: Pedestrian 🚶 ==========
+        ped_title = QLabel("🚶 Ped")
+        ped_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        ped_title.setStyleSheet("color: #64748b;")
+        ped_title.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(ped_title, 0, 1)
+        
+        self.status_pedestrian_now = QLabel("0")
+        self.status_pedestrian_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        self.status_pedestrian_now.setStyleSheet("color: #0f172a;")
+        self.status_pedestrian_now.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_pedestrian_now, 1, 1)
+        
+        self.status_pedestrian_total = QLabel("Total: 0")
+        self.status_pedestrian_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
+        self.status_pedestrian_total.setStyleSheet("color: #64748b;")
+        self.status_pedestrian_total.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_pedestrian_total, 2, 1)
+        
+        # ========== Column 2: Bicycle 🚲 ==========
+        bike_title = QLabel("🚲 Bike")
+        bike_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        bike_title.setStyleSheet("color: #64748b;")
+        bike_title.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(bike_title, 0, 2)
+        
+        self.status_bicycle_now = QLabel("0")
+        self.status_bicycle_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        self.status_bicycle_now.setStyleSheet("color: #0f172a;")
+        self.status_bicycle_now.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_bicycle_now, 1, 2)
+        
+        self.status_bicycle_total = QLabel("Total: 0")
+        self.status_bicycle_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
+        self.status_bicycle_total.setStyleSheet("color: #64748b;")
+        self.status_bicycle_total.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_bicycle_total, 2, 2)
+        
+        # ========== Column 3: Motorbike 🏍️ ==========
+        moto_title = QLabel("🏍️ Moto")
+        moto_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        moto_title.setStyleSheet("color: #64748b;")
+        moto_title.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(moto_title, 0, 3)
+        
+        self.status_moto_now = QLabel("0")
+        self.status_moto_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        self.status_moto_now.setStyleSheet("color: #0f172a;")
+        self.status_moto_now.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_moto_now, 1, 3)
+        
+        self.status_moto_total = QLabel("Total: 0")
+        self.status_moto_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
+        self.status_moto_total.setStyleSheet("color: #64748b;")
+        self.status_moto_total.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_moto_total, 2, 3)
+        
+        # ========== Column 4: Car 🚗 ==========
+        car_title = QLabel("🚗 Car")
+        car_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        car_title.setStyleSheet("color: #64748b;")
+        car_title.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(car_title, 0, 4)
+        
+        self.status_car_now = QLabel("0")
+        self.status_car_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        self.status_car_now.setStyleSheet("color: #0f172a;")
+        self.status_car_now.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_car_now, 1, 4)
+        
+        self.status_car_total = QLabel("Total: 0")
+        self.status_car_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
+        self.status_car_total.setStyleSheet("color: #64748b;")
+        self.status_car_total.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_car_total, 2, 4)
+        
+        # ========== Column 5: Truck 🚚 ==========
+        truck_title = QLabel("🚚 Truck")
+        truck_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        truck_title.setStyleSheet("color: #64748b;")
+        truck_title.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(truck_title, 0, 5)
+        
+        self.status_truck_now = QLabel("0")
+        self.status_truck_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        self.status_truck_now.setStyleSheet("color: #0f172a;")
+        self.status_truck_now.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_truck_now, 1, 5)
+        
+        self.status_truck_total = QLabel("Total: 0")
+        self.status_truck_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
+        self.status_truck_total.setStyleSheet("color: #64748b;")
+        self.status_truck_total.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_truck_total, 2, 5)
+        
+        # ========== Column 6: Container Truck 📦 ==========
+        container_title = QLabel("📦 Cont")
+        container_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        container_title.setStyleSheet("color: #64748b;")
+        container_title.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(container_title, 0, 6)
+        
+        self.status_container_now = QLabel("0")
+        self.status_container_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        self.status_container_now.setStyleSheet("color: #0f172a;")
+        self.status_container_now.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_container_now, 1, 6)
+        
+        self.status_container_total = QLabel("Total: 0")
+        self.status_container_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
+        self.status_container_total.setStyleSheet("color: #64748b;")
+        self.status_container_total.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_container_total, 2, 6)
+        
+        # ========== Column 7: Bus 🚌 ==========
+        bus_title = QLabel("🚌 Bus")
+        bus_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        bus_title.setStyleSheet("color: #64748b;")
+        bus_title.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(bus_title, 0, 7)
+        
+        self.status_bus_now = QLabel("0")
+        self.status_bus_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        self.status_bus_now.setStyleSheet("color: #0f172a;")
+        self.status_bus_now.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_bus_now, 1, 7)
+        
+        self.status_bus_total = QLabel("Total: 0")
+        self.status_bus_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
+        self.status_bus_total.setStyleSheet("color: #64748b;")
+        self.status_bus_total.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_bus_total, 2, 7)
+        
+        # ========== Column 8: TOTAL ALL 📊 ==========
+        total_title = QLabel("📊 Total")
+        total_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        total_title.setStyleSheet("color: #1e40af;")
+        total_title.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(total_title, 0, 8)
+        
+        self.status_total_now = QLabel("0")
+        self.status_total_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        self.status_total_now.setStyleSheet("color: #1e40af;")
+        self.status_total_now.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_total_now, 1, 8)
+        
+        self.status_total_session = QLabel("Session: 0")
+        self.status_total_session.setFont(QFont("Segoe UI", 8, QFont.Normal))
+        self.status_total_session.setStyleSheet("color: #64748b;")
+        self.status_total_session.setAlignment(Qt.AlignCenter)
+        metrics_layout.addWidget(self.status_total_session, 2, 8)
+        
+        # Set equal column stretch
+        for col in range(9):
+            metrics_layout.setColumnStretch(col, 1)
+        
+        panel_layout.addWidget(metrics_container)
+        
+        parent_layout.addWidget(panel)
+
+    def _normalize_vehicle_counts(self, counts):
+        """Normalize all 7 object classes"""
+        normalized = {
+            "pedestrian": 0,
+            "bicycle": 0,
+            "motorbike": 0,
+            "car": 0,
+            "truck": 0,
+            "container truck": 0,
+            "bus": 0
+        }
+        if not counts:
+            return normalized
+        for cls_name, count in counts.items():
+            key = str(cls_name).strip().lower()
+            # Map variations to standard names
+            if key in ["pedestrian", "person", "people"]:
+                normalized["pedestrian"] += int(count)
+            elif key in ["bicycle", "bike", "cycle"]:
+                normalized["bicycle"] += int(count)
+            elif key in ["motorbike", "motorcycle", "moto"]:
+                normalized["motorbike"] += int(count)
+            elif key in ["car", "sedan"]:
+                normalized["car"] += int(count)
+            elif key in ["truck"]:
+                normalized["truck"] += int(count)
+            elif key in ["container truck", "container", "semi"]:
+                normalized["container truck"] += int(count)
+            elif key in ["bus"]:
+                normalized["bus"] += int(count)
+        return normalized
+
+    def _format_vehicle_counts(self, counts):
+        order = [
+            ("car", "Car"),
+            ("truck", "Truck"),
+            ("bus", "Bus"),
+            ("motorcycle", "Moto"),
+        ]
+        parts = [f"{label}: {counts.get(key, 0)}" for key, label in order]
+        return " | ".join(parts)
 
     def _update_fps_summary(self, stats):
-        """Combine FPS and the most useful runtime stats into one large card."""
-        active_objects = stats.get('active_objects', stats.get('total_objects', 0))
-        total_objects = stats.get('total_objects', 0)
-        active_class_counts = stats.get('active_class_counts', stats.get('class_counts', {}))
-        avg_fps = sum(self.fps_history) / len(self.fps_history) if self.fps_history else self.current_fps
+        """Update FPS in single column (Display FPS only - most accurate)"""
+        # Use Display FPS as the main metric (what user actually sees)
+        main_fps = self.current_render_fps
+        
+        if hasattr(self, 'status_main_fps'):
+            self.status_main_fps.setText(f"{main_fps:.1f}")
+            
+            # Color coding based on FPS
+            if main_fps >= 20:
+                color = '#22c55e'  # Green
+            elif main_fps >= 10:
+                color = '#f59e0b'  # Yellow
+            else:
+                color = '#ef4444'  # Red
+            
+            self.status_main_fps.setStyleSheet(f"color: {color}; font-weight: 700;")
 
-        summary_lines = [
-            f"Display FPS: {self.current_render_fps:4.1f} | Process FPS: {self.current_fps:4.1f} | Avg: {avg_fps:4.1f}",
-            f"Active: {active_objects} | Session: {total_objects}",
-            f"Now: {self._format_count_summary(active_class_counts, 'no detections')}",
-        ]
-        self.fps_label.setText("\n".join(summary_lines))
+    def _extract_vehicle_count(self, counts):
+        """Return active vehicle count from class-count payload."""
+        normalized = self._normalize_vehicle_counts(counts)
+        return sum(normalized.values())
 
-        visible_fps = min(
-            value for value in (self.current_render_fps, self.current_fps) if value > 0
-        ) if (self.current_render_fps > 0 or self.current_fps > 0) else 0.0
-        self._set_fps_badge_color(visible_fps)
+    def _update_vehicle_alert_ui(self, stats):
+        """Update vehicle alert UI with 8-column layout (1 FPS + 7 object classes)"""
+        active_counts = stats.get('active_class_counts', {}) if isinstance(stats, dict) else {}
+        total_counts = stats.get('class_counts', {}) if isinstance(stats, dict) else {}
+        active_all_counts = self._normalize_vehicle_counts(active_counts)
+        total_all_counts = self._normalize_vehicle_counts(total_counts)
+
+        roi_active = False
+        try:
+            roi_active = bool(self.roi_manager and self.roi_manager.is_active())
+        except Exception:
+            roi_active = False
+
+        if roi_active:
+            current_vehicles = sum(active_all_counts.values())
+            scope_text = "ROI"
+        else:
+            current_vehicles = sum(total_all_counts.values())
+            scope_text = "Full"
+        total_vehicles = sum(total_all_counts.values())
+
+        limit = max(1, int(self.vehicle_alert_limit))
+        ratio = current_vehicles / float(limit)
+
+        if ratio > 1.0:
+            level = "ALERT"
+            color = "#ef4444"
+            message = "VUOT NGUONG"
+        elif ratio >= self.alert_yellow_ratio:
+            level = "WARN"
+            color = "#f59e0b"
+            message = "GAN NGUONG"
+        else:
+            level = "NORMAL"
+            color = "#22c55e"
+            message = "AN TOAN"
+
+        ratio_percent = min(999, int(ratio * 100))
+        
+        # Update status badge with detailed traffic info
+        if hasattr(self, 'status_level_badge'):
+            # Format: "AN TOAN | 6/20 (30%)"
+            badge_text = f"{message} | {current_vehicles}/{limit} ({ratio_percent}%)"
+            self.status_level_badge.setText(badge_text)
+            self.status_level_badge.setStyleSheet(
+                f"background: {color};"
+                "color: #ffffff;"
+                "border-radius: 12px;"
+                "padding: 8px 16px;"
+                "font-weight: 700;"
+                "font-size: 12px;"
+                "letter-spacing: 0.5px;"
+            )
+
+        # Update individual object columns (Now + Total)
+        if hasattr(self, 'status_pedestrian_now'):
+            self.status_pedestrian_now.setText(str(active_all_counts.get('pedestrian', 0)))
+        if hasattr(self, 'status_pedestrian_total'):
+            self.status_pedestrian_total.setText(f"Total: {total_all_counts.get('pedestrian', 0)}")
+            
+        if hasattr(self, 'status_bicycle_now'):
+            self.status_bicycle_now.setText(str(active_all_counts.get('bicycle', 0)))
+        if hasattr(self, 'status_bicycle_total'):
+            self.status_bicycle_total.setText(f"Total: {total_all_counts.get('bicycle', 0)}")
+            
+        if hasattr(self, 'status_moto_now'):
+            self.status_moto_now.setText(str(active_all_counts.get('motorbike', 0)))
+        if hasattr(self, 'status_moto_total'):
+            self.status_moto_total.setText(f"Total: {total_all_counts.get('motorbike', 0)}")
+            
+        if hasattr(self, 'status_car_now'):
+            self.status_car_now.setText(str(active_all_counts.get('car', 0)))
+        if hasattr(self, 'status_car_total'):
+            self.status_car_total.setText(f"Total: {total_all_counts.get('car', 0)}")
+            
+        if hasattr(self, 'status_truck_now'):
+            self.status_truck_now.setText(str(active_all_counts.get('truck', 0)))
+        if hasattr(self, 'status_truck_total'):
+            self.status_truck_total.setText(f"Total: {total_all_counts.get('truck', 0)}")
+            
+        if hasattr(self, 'status_container_now'):
+            self.status_container_now.setText(str(active_all_counts.get('container truck', 0)))
+        if hasattr(self, 'status_container_total'):
+            self.status_container_total.setText(f"Total: {total_all_counts.get('container truck', 0)}")
+            
+        if hasattr(self, 'status_bus_now'):
+            self.status_bus_now.setText(str(active_all_counts.get('bus', 0)))
+        if hasattr(self, 'status_bus_total'):
+            self.status_bus_total.setText(f"Total: {total_all_counts.get('bus', 0)}")
+        
+        # Update TOTAL column (sum of all classes)
+        total_now = sum(active_all_counts.values())
+        total_session = sum(total_all_counts.values())
+        
+        if hasattr(self, 'status_total_now'):
+            self.status_total_now.setText(str(total_now))
+        if hasattr(self, 'status_total_session'):
+            self.status_total_session.setText(f"Session: {total_session}")
+
+        # Update video border color
+        if hasattr(self, 'video_label'):
+            self.video_label.setStyleSheet(
+                f"border: 4px solid {color};"
+                "border-radius: 10px;"
+                "background: #081018;"
+            )
+        self.last_alert_color = color
 
     def _update_stats_panel(self, stats):
         """Render the detailed stats panel with larger, aligned text."""
@@ -3064,6 +3774,90 @@ class MainWindow(QMainWindow):
         if stats_text != self.last_stats_text:
             self.stats_text.setPlainText(stats_text)
             self.last_stats_text = stats_text
+
+    def on_source_grid_columns_changed(self, text):
+        try:
+            columns = int(str(text).strip())
+        except Exception:
+            columns = 5
+        self.source_grid_columns = max(2, min(7, columns))
+        self._apply_admin_source_grid_columns(refresh_cards=True)
+        self.schedule_settings_save()
+
+    def on_source_text_size_changed(self, text):
+        allowed = {"Small", "Medium", "Large"}
+        value = str(text).strip()
+        self.source_tile_text_size = value if value in allowed else "Medium"
+        self._apply_admin_source_grid_columns(refresh_cards=True)
+        self.schedule_settings_save()
+
+    def on_pin_active_source_changed(self, checked):
+        self.pin_active_source_first = bool(checked)
+        self.refresh_admin_source_cards()
+        self.schedule_settings_save()
+
+    def _apply_admin_source_grid_columns(self, refresh_cards=False):
+        """Apply grid column layout with proper viewport width detection"""
+        if not hasattr(self, 'admin_source_list'):
+            return
+
+        columns = max(2, min(7, int(getattr(self, 'source_grid_columns', 5))))
+        
+        # Get actual viewport width (wait for widget to be visible)
+        viewport = self.admin_source_list.viewport()
+        if not viewport or not viewport.isVisible():
+            # Widget not ready yet, schedule retry
+            QTimer.singleShot(100, lambda: self._apply_admin_source_grid_columns(refresh_cards=refresh_cards))
+            return
+        
+        list_width = max(320, viewport.width())
+        
+        # Ensure minimum width for proper calculation
+        if list_width < 400:
+            list_width = max(800, self.admin_source_list.width() - 20)
+        
+        usable_width = max(280, list_width - 8)
+
+        min_spacing = 6
+        max_spacing = 20
+        spacing = 10
+        card_w = max(170, (usable_width - spacing * (columns + 1)) // columns)
+
+        if card_w < 170:
+            spacing = min_spacing
+            card_w = max(160, (usable_width - spacing * (columns + 1)) // columns)
+
+        card_w = min(440, card_w)
+        distributed = usable_width - (card_w * columns)
+        spacing = max(min_spacing, min(max_spacing, distributed // (columns + 1)))
+        self.admin_source_list.setSpacing(spacing)
+
+        preview_w = max(156, card_w - 18)
+        preview_h = max(88, int(preview_w * 9 / 16))
+        text_size_map = {"Small": 9, "Medium": 10, "Large": 11}
+        font_pt = text_size_map.get(self.source_tile_text_size, 10)
+        list_font = self.admin_source_list.font()
+        list_font.setPointSize(font_pt)
+        self.admin_source_list.setFont(list_font)
+
+        label_block_h = {"Small": 48, "Medium": 54, "Large": 62}.get(self.source_tile_text_size, 54)
+        card_h = preview_h + label_block_h
+
+        size_changed = (preview_w != self.preview_width) or (preview_h != self.preview_height)
+        self.preview_width = preview_w
+        self.preview_height = preview_h
+        self.admin_source_list.setIconSize(QSize(preview_w, preview_h))
+        self.admin_source_list.setGridSize(QSize(card_w, card_h))
+
+        if refresh_cards:
+            if size_changed:
+                self.source_preview_cache.clear()
+            self.refresh_admin_source_cards()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'admin_source_list'):
+            self._apply_admin_source_grid_columns(refresh_cards=False)
         
     def update_frame(self, frame_version):
         """Receive the latest processed frame without doing heavy GUI work."""
@@ -3089,6 +3883,8 @@ class MainWindow(QMainWindow):
             self.pending_display_frame = latest_frame
             self.pending_display_stats = latest_stats
             self.pending_frame_dirty = True
+            # Only count frames that are actually new
+            self.render_fps_counter += 1
 
         if version > self.metrics_last_version:
             self.fps_counter += (version - self.metrics_last_version)
@@ -3107,7 +3903,7 @@ class MainWindow(QMainWindow):
 
             if self.adaptive_fps:
                 self._maybe_adaptive_tune()
-            self._update_fps_summary(self.pending_display_stats)
+            # Don't update FPS UI here - will be updated with render FPS below
             self._update_stats_panel(self.pending_display_stats)
 
             self.fps_counter = 0
@@ -3176,7 +3972,8 @@ class MainWindow(QMainWindow):
             )
             self.video_label.setPixmap(scaled_pixmap)
 
-        self.render_fps_counter += 1
+        self._capture_runtime_preview_for_active_source(frame)
+
         render_elapsed = time.perf_counter() - self.render_fps_start_time
         if render_elapsed >= self.fps_sample_interval:
             render_sample = self.render_fps_counter / render_elapsed
@@ -3184,6 +3981,17 @@ class MainWindow(QMainWindow):
             self.render_fps_counter = 0
             self.render_fps_start_time = time.perf_counter()
             self._update_fps_summary(self.pending_display_stats)
+            self._update_vehicle_alert_ui(self.pending_display_stats)
+
+    def on_vehicle_alert_scope_changed(self, text):
+        # Scope is now automatic: ROI when active, otherwise Full Frame.
+        self.vehicle_alert_scope = "AUTO"
+        self.schedule_settings_save()
+
+    def on_vehicle_alert_limit_changed(self, value):
+        self.vehicle_alert_limit = max(1, int(value))
+        self.vehicle_alert_limit_label.setText(f"{self.vehicle_alert_limit} vehicles")
+        self.schedule_settings_save()
 
     def closeEvent(self, event):
         """Handle window close"""
@@ -3235,11 +4043,21 @@ class MainWindow(QMainWindow):
             'stream_quality': self.stream_quality_combo.currentText(),
             'video_type': self.video_type_combo.currentText(),
             'last_video_file_path': last_video_file_path,
+
+            # Source admin hub
+            'source_profiles': self.source_profiles,
+            'source_profile_counter': self.source_profile_counter,
+            'active_source_profile_id': self.active_source_profile_id,
+            'source_grid_columns': self.source_grid_columns,
+            'source_tile_text_size': self.source_tile_text_size,
+            'pin_active_source_first': self.pin_active_source_first,
             
             # ROI settings
             'roi_threshold': self.roi_threshold_slider.value(),
             'roi_visible': self.roi_visible,
             'roi_config': self.roi_manager.get_config() if self.roi_manager.is_active() else None,
+            'vehicle_alert_limit': self.vehicle_alert_limit,
+            'vehicle_alert_scope': 'AUTO',
 
             # Panel state
             'sidebar_visible': self.scroll_area.isVisible(),
@@ -3392,10 +4210,63 @@ class MainWindow(QMainWindow):
             if isinstance(last_video_file_path, str) and Path(last_video_file_path).exists():
                 self.video_source = last_video_file_path
                 self.btn_start.setEnabled(True)
+
+            loaded_profiles = settings.get('source_profiles', [])
+            if isinstance(loaded_profiles, list):
+                self.source_profiles = []
+                for profile in loaded_profiles:
+                    if not isinstance(profile, dict):
+                        continue
+                    source = profile.get('source')
+                    if source is None:
+                        continue
+                    normalized = {
+                        'id': profile.get('id', self.source_profile_counter),
+                        'source': source,
+                        'source_key': profile.get('source_key', self._source_to_key(source)),
+                        'source_type': profile.get('source_type', 'source'),
+                        'name': profile.get('name', self._display_name_for_source(source)),
+                        'settings': profile.get('settings', {}),
+                    }
+                    self.source_profiles.append(normalized)
+            self.source_profile_counter = int(settings.get('source_profile_counter', max(1, len(self.source_profiles) + 1)))
+            if self.source_profiles:
+                max_id = max(int(p.get('id', 0)) for p in self.source_profiles)
+                self.source_profile_counter = max(self.source_profile_counter, max_id + 1)
+            self.active_source_profile_id = settings.get('active_source_profile_id')
+            loaded_columns = int(settings.get('source_grid_columns', self.source_grid_columns))
+            self.source_grid_columns = max(2, min(7, loaded_columns))
+            loaded_text_size = str(settings.get('source_tile_text_size', self.source_tile_text_size))
+            if loaded_text_size not in {"Small", "Medium", "Large"}:
+                loaded_text_size = "Medium"
+            self.source_tile_text_size = loaded_text_size
+            self.pin_active_source_first = bool(settings.get('pin_active_source_first', self.pin_active_source_first))
+            if hasattr(self, 'source_grid_combo'):
+                self.source_grid_combo.blockSignals(True)
+                self.source_grid_combo.setCurrentText(str(self.source_grid_columns))
+                self.source_grid_combo.blockSignals(False)
+            if hasattr(self, 'source_text_size_combo'):
+                self.source_text_size_combo.blockSignals(True)
+                self.source_text_size_combo.setCurrentText(self.source_tile_text_size)
+                self.source_text_size_combo.blockSignals(False)
+            if hasattr(self, 'pin_active_checkbox'):
+                self.pin_active_checkbox.blockSignals(True)
+                self.pin_active_checkbox.setChecked(self.pin_active_source_first)
+                self.pin_active_checkbox.blockSignals(False)
+            self._apply_admin_source_grid_columns(refresh_cards=False)
+            self._refresh_source_profiles_ui()
             
             # ROI settings
             if 'roi_threshold' in settings:
                 self.roi_threshold_slider.setValue(settings['roi_threshold'])
+
+            if 'vehicle_alert_limit' in settings and hasattr(self, 'vehicle_alert_limit_slider'):
+                self.vehicle_alert_limit_slider.setValue(int(settings['vehicle_alert_limit']))
+            if hasattr(self, 'vehicle_alert_scope_combo'):
+                self.vehicle_alert_scope = 'AUTO'
+                self.vehicle_alert_scope_combo.blockSignals(True)
+                self.vehicle_alert_scope_combo.setCurrentIndex(0)
+                self.vehicle_alert_scope_combo.blockSignals(False)
             
             if 'roi_visible' in settings:
                 self.roi_visible = settings['roi_visible']
@@ -3415,15 +4286,22 @@ class MainWindow(QMainWindow):
 
             if settings.get('sidebar_visible') is False:
                 self.scroll_area.setVisible(False)
-                self.btn_toggle_sidebar.setText("Show Controls")
+                self.btn_toggle_sidebar.setText("Mo Cau Hinh")
             else:
                 self.scroll_area.setVisible(True)
-                self.btn_toggle_sidebar.setText("Hide Controls")
+                self.btn_toggle_sidebar.setText("An Cau Hinh")
             runtime_expanded = settings.get('runtime_expanded', True)
             self.runtime_toggle_button.blockSignals(True)
             self.runtime_toggle_button.setChecked(runtime_expanded)
             self.runtime_toggle_button.blockSignals(False)
             self.toggle_runtime_section()
+
+            # Enforce page-specific visibility after settings restore.
+            if hasattr(self, 'main_view_stack'):
+                if self.main_view_stack.currentIndex() == 0:
+                    self.show_admin_dashboard()
+                else:
+                    self.show_player_view()
             
             self._refresh_custom_model_input()
             self._refresh_runtime_overview()
@@ -3444,19 +4322,1054 @@ class MainWindow(QMainWindow):
                         self.stream_input.addItem(url)
             except Exception as e:
                 print(f"Error loading stream history: {e}")
+
+    def _capture_source_profile_settings(self):
+        """Capture current control values into a source profile payload."""
+        return {
+            'model_choice': self.model_combo.currentText(),
+            'tracker_choice': self.tracker_combo.currentText(),
+            'confidence': self.confidence_slider.value(),
+            'duplicate_iou_threshold': self.duplicate_iou_slider.value(),
+            'max_det': self.max_det_slider.value(),
+            'tracker_age': self.tracker_age_slider.value(),
+            'resize_scale': self.resize_combo.currentText(),
+            'display_point_mode': self.btn_display_mode.isChecked(),
+            'trail_enabled': self.btn_trail_toggle.isChecked(),
+        }
+
+    def _apply_source_profile_settings(self, settings):
+        """Apply source-specific settings to the control panel."""
+        if not settings:
+            return
+
+        try:
+            model_choice = settings.get('model_choice')
+            if model_choice:
+                index = self.model_combo.findText(model_choice)
+                if index >= 0:
+                    self.model_combo.setCurrentIndex(index)
+
+            tracker_choice = settings.get('tracker_choice')
+            if tracker_choice:
+                index = self.tracker_combo.findText(tracker_choice)
+                if index >= 0:
+                    self.tracker_combo.setCurrentIndex(index)
+
+            if 'confidence' in settings:
+                self.confidence_slider.setValue(int(settings['confidence']))
+            if 'duplicate_iou_threshold' in settings:
+                self.duplicate_iou_slider.setValue(int(settings['duplicate_iou_threshold']))
+            if 'max_det' in settings:
+                self.max_det_slider.setValue(int(settings['max_det']))
+            if 'tracker_age' in settings:
+                self.tracker_age_slider.setValue(int(settings['tracker_age']))
+
+            resize_text = settings.get('resize_scale')
+            if resize_text:
+                index = self.resize_combo.findText(resize_text)
+                if index >= 0:
+                    self.resize_combo.setCurrentIndex(index)
+
+            if 'display_point_mode' in settings:
+                checked = bool(settings['display_point_mode'])
+                self.btn_display_mode.setChecked(checked)
+                self.toggle_display_mode(checked)
+
+            if 'trail_enabled' in settings:
+                checked = bool(settings['trail_enabled'])
+                self.btn_trail_toggle.setChecked(checked)
+                self.toggle_trail(checked)
+        except Exception as exc:
+            print(f"[WARN] Apply source profile settings failed: {exc}")
+
+    def _source_to_key(self, source):
+        if isinstance(source, int):
+            return f"cam:{source}"
+
+        text = str(source).strip()
+        if text.isdigit():
+            return f"cam:{int(text)}"
+
+        if Path(text).exists():
+            try:
+                return f"file:{str(Path(text).resolve()).lower()}"
+            except Exception:
+                return f"file:{text.lower()}"
+
+        try:
+            parts = urlsplit(text)
+            scheme = parts.scheme.lower()
+            if scheme in ("http", "https", "rtsp", "rtsps") and parts.netloc:
+                netloc = parts.netloc.lower()
+                path = parts.path or ""
+                while len(path) > 1 and path.endswith("/"):
+                    path = path[:-1]
+                query_items = sorted(parse_qsl(parts.query, keep_blank_values=True))
+                query = urlencode(query_items, doseq=True)
+                normalized_url = urlunsplit((scheme, netloc, path, query, ""))
+                return f"url:{normalized_url}"
+        except Exception:
+            pass
+
+        return text.casefold()
+
+    def _display_name_for_source(self, source):
+        if isinstance(source, int):
+            return f"Camera {source}"
+        text = str(source).strip()
+        if text.startswith("rtsp://"):
+            return "RTSP Source"
+        if text.startswith(("http://", "https://")):
+            return "Web Stream"
+        p = Path(text)
+        if p.exists():
+            return p.name
+        return text[:48]
+
+    def _find_source_profile_index(self, source):
+        if source is None:
+            return -1
+        key = self._source_to_key(source)
+        for i, profile in enumerate(self.source_profiles):
+            profile_key = profile.get('source_key')
+            # Fallback: compute key if missing or empty
+            if not profile_key:
+                profile_source = profile.get('source')
+                if profile_source is not None:
+                    profile_key = self._source_to_key(profile_source)
+                    # Cache it for future lookups
+                    profile['source_key'] = profile_key
+            if profile_key and profile_key == key:
+                return i
+        return -1
+
+    def _create_placeholder_preview(self, title="NO PREVIEW"):
+        pixmap = QPixmap(self.preview_width, self.preview_height)
+        pixmap.fill(QColor("#1b2733"))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QColor("#f8d4a4"))
+        painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, title)
+        painter.end()
+        return pixmap
+
+    def _preview_pixmap_from_bgr_frame(self, frame):
+        if frame is None or frame.size == 0:
+            return None
+
+        h, w = frame.shape[:2]
+        target_ratio = self.preview_width / max(1, self.preview_height)
+        frame_ratio = w / max(1, h)
+
+        if frame_ratio > target_ratio:
+            crop_w = int(h * target_ratio)
+            start_x = max(0, (w - crop_w) // 2)
+            crop = frame[:, start_x:start_x + crop_w]
+        else:
+            crop_h = int(w / max(target_ratio, 1e-6))
+            start_y = max(0, (h - crop_h) // 2)
+            crop = frame[start_y:start_y + crop_h, :]
+
+        thumb = cv2.resize(crop, (self.preview_width, self.preview_height), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+        qimage = QImage(
+            rgb.data,
+            self.preview_width,
+            self.preview_height,
+            self.preview_width * 3,
+            QImage.Format_RGB888
+        )
+        return QPixmap.fromImage(qimage.copy())
+
+    def _youtube_thumbnail_pixmap(self, source_url):
+        try:
+            import yt_dlp
+
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(str(source_url), download=False)
+
+            thumb_url = info.get('thumbnail')
+            if not thumb_url:
+                thumbnails = info.get('thumbnails') or []
+                if thumbnails:
+                    thumb_url = thumbnails[-1].get('url')
+
+            if thumb_url:
+                with urllib.request.urlopen(thumb_url, timeout=3.0) as response:
+                    data = response.read()
+                arr = np.frombuffer(data, dtype=np.uint8)
+                image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if image is not None:
+                    return self._preview_pixmap_from_bgr_frame(image)
+        except Exception:
+            return None
+        return None
+
+    def _source_preview_pixmap(self, source, max_wait_s=None):
+        key = self._source_to_key(source)
+        cached = self.source_preview_cache.get(key)
+        if cached is not None:
+            return cached
+
+        source_text = str(source).strip().lower()
+        is_network = source_text.startswith(("rtsp://", "rtsps://", "http://", "https://"))
+
+        if ("youtube.com" in source_text) or ("youtu.be" in source_text):
+            yt_pixmap = self._youtube_thumbnail_pixmap(source)
+            if yt_pixmap is not None:
+                self.source_preview_cache[key] = yt_pixmap
+                self.source_preview_meta[key] = {'kind': 'real', 'ts': time.time(), 'via': 'youtube-thumb'}
+                self.preview_retry_after.pop(key, None)
+                return yt_pixmap
+
+        if max_wait_s is None:
+            max_wait_s = 2.2 if is_network else 0.9
+
+        pixmap = None
+        cap = None
+        try:
+            if isinstance(source, int):
+                cap = cv2.VideoCapture(source)
+            else:
+                text = str(source).strip()
+                if text.lower().startswith("rtsp://"):
+                    cap = cv2.VideoCapture(text, cv2.CAP_FFMPEG)
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                else:
+                    cap = cv2.VideoCapture(text)
+
+            if cap is not None and cap.isOpened():
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 2500)
+                if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2500)
+
+                # Many HEVC streams fail on first packets; warm-up grabs improve first decodable frame odds.
+                warmup_grabs = 12 if is_network else 4
+                for _ in range(warmup_grabs):
+                    cap.grab()
+
+                frame = None
+                deadline = time.time() + max_wait_s
+                attempts = 0
+                while time.time() < deadline:
+                    attempts += 1
+                    ret, candidate = cap.read()
+                    if ret and candidate is not None and candidate.size > 0:
+                        frame = candidate
+                        break
+                    cap.grab()
+                    time.sleep(0.025)
+                    if attempts >= 80:
+                        break
+
+                if frame is not None:
+                    pixmap = self._preview_pixmap_from_bgr_frame(frame)
+        except Exception:
+            pixmap = None
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+
+        if pixmap is None:
+            pixmap = self._create_placeholder_preview("NO SIGNAL")
+            self.source_preview_meta[key] = {'kind': 'placeholder', 'ts': time.time(), 'via': 'fallback'}
+            self.preview_retry_after[key] = time.time() + 20.0
+        else:
+            self.source_preview_meta[key] = {'kind': 'real', 'ts': time.time(), 'via': 'capture'}
+            self.preview_retry_after.pop(key, None)
+
+        self.source_preview_cache[key] = pixmap
+        return pixmap
+
+    def _enqueue_preview_load(self, source, force=False):
+        key = self._source_to_key(source)
+        if key in self.source_preview_cache or key in self.preview_load_pending:
+            return
+
+        if not force:
+            retry_at = self.preview_retry_after.get(key, 0.0)
+            if retry_at > time.time():
+                return
+
+        self.preview_load_queue.append(source)
+        self.preview_load_pending.add(key)
+        if not self.preview_loader_timer.isActive():
+            self.preview_loader_timer.start(15)
+
+    def _process_preview_queue(self):
+        if not self.preview_load_queue:
+            return
+
+        source = self.preview_load_queue.pop(0)
+        key = self._source_to_key(source)
+        try:
+            pixmap = self._source_preview_pixmap(source, max_wait_s=0.35)
+            self._update_admin_card_preview_icon(key, pixmap)
+        finally:
+            self.preview_load_pending.discard(key)
+
+        if self.preview_load_queue:
+            self.preview_loader_timer.start(15)
+
+    def _update_admin_card_preview_icon(self, source_key, pixmap):
+        if not hasattr(self, 'admin_source_list'):
+            return
+
+        row = -1
+        for idx, profile in enumerate(self.source_profiles):
+            if self._source_to_key(profile.get('source')) == source_key:
+                row = idx
+                break
+        if row < 0 or row >= self.admin_source_list.count():
+            return
+
+        item = self.admin_source_list.item(row)
+        if item is not None:
+            item.setIcon(QIcon(pixmap))
+
+    def add_admin_source_from_input(self):
+        raw = self.admin_source_input.text().strip() if hasattr(self, 'admin_source_input') else ""
+        if not raw:
+            if hasattr(self, 'source_profile_status'):
+                self.source_profile_status.setText("Enter source URL or camera id")
+            return
+        source = int(raw) if raw.isdigit() else raw
+        existed_before = self._find_source_profile_index(source) >= 0
+        display_name = self.admin_name_input.text().strip() if hasattr(self, 'admin_name_input') else ""
+        src_key = self._source_to_key(source)
+        self.source_preview_cache.pop(src_key, None)
+        self.source_preview_meta.pop(src_key, None)
+        self.preview_retry_after.pop(src_key, None)
+        self._upsert_source_profile(
+            source,
+            source_type=self._infer_source_type(source),
+            auto_select=True,
+            display_name=display_name or None
+        )
+        self.schedule_settings_save()
+        self.refresh_admin_source_cards()
+        if hasattr(self, 'source_profile_status'):
+            self.source_profile_status.setText("Nguon da ton tai: da cap nhat" if existed_before else "Da them nguon")
+
+    def add_admin_source_from_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Video File", "", "Video Files (*.mp4 *.avi *.mov *.mkv *.webm)"
+        )
+        if not file_path:
+            return
+        existed_before = self._find_source_profile_index(file_path) >= 0
+        display_name = self.admin_name_input.text().strip() if hasattr(self, 'admin_name_input') else ""
+        src_key = self._source_to_key(file_path)
+        self.source_preview_cache.pop(src_key, None)
+        self.source_preview_meta.pop(src_key, None)
+        self.preview_retry_after.pop(src_key, None)
+        self._upsert_source_profile(
+            file_path,
+            source_type="file",
+            auto_select=True,
+            display_name=display_name or None
+        )
+        self.schedule_settings_save()
+        self.refresh_admin_source_cards()
+        if hasattr(self, 'source_profile_status'):
+            if existed_before:
+                self.source_profile_status.setText("File da ton tai: da cap nhat")
+            else:
+                self.source_profile_status.setText(f"Da them file: {Path(file_path).name}")
+
+    def refresh_admin_source_previews(self):
+        self.preview_load_queue.clear()
+        self.preview_load_pending.clear()
+        if self.preview_loader_timer.isActive():
+            self.preview_loader_timer.stop()
+        self.source_preview_cache.clear()
+        self.source_preview_meta.clear()
+        self.preview_retry_after.clear()
+        self.refresh_admin_source_cards()
+        if hasattr(self, 'source_profile_status'):
+            self.source_profile_status.setText("Previews refreshed")
+
+    def _infer_source_type(self, source):
+        if isinstance(source, int):
+            return "camera"
+        text = str(source).strip().lower()
+        if Path(str(source)).exists():
+            return "file"
+        if "youtube" in text or "youtu.be" in text:
+            return "youtube"
+        if text.startswith("rtsp://"):
+            return "rtsp"
+        if text.startswith(("http://", "https://")):
+            return "stream"
+        return "source"
+
+    def open_source_manager_dialog(self):
+        """Open dedicated source-management page as a separate dialog."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Source Manager")
+        dialog.resize(760, 520)
+
+        root = QVBoxLayout(dialog)
+        title = QLabel("Camera and Stream Sources")
+        title.setObjectName("videoTitle")
+        root.addWidget(title)
+
+        subtitle = QLabel("Select one source profile and open it in the main player.")
+        subtitle.setObjectName("subtleInfo")
+        subtitle.setWordWrap(True)
+        root.addWidget(subtitle)
+
+        source_input_row = QHBoxLayout()
+        source_input = QLineEdit()
+        source_input.setPlaceholderText("rtsp://..., https://..., or camera id like 0")
+        source_input_row.addWidget(source_input)
+
+        btn_add_source = QPushButton("Add Source")
+        source_input_row.addWidget(btn_add_source)
+        root.addLayout(source_input_row)
+
+        list_widget = QListWidget()
+        list_widget.setMinimumHeight(280)
+        root.addWidget(list_widget)
+
+        status = QLabel("Ready")
+        status.setObjectName("subtleInfo")
+        root.addWidget(status)
+
+        btn_row = QHBoxLayout()
+        btn_add_current = QPushButton("Add Current")
+        btn_row.addWidget(btn_add_current)
+
+        btn_remove = QPushButton("Remove Selected")
+        btn_remove.setObjectName("dangerAction")
+        btn_row.addWidget(btn_remove)
+
+        btn_open = QPushButton("Open Selected")
+        btn_open.setObjectName("primaryAction")
+        btn_row.addWidget(btn_open)
+
+        btn_close = QPushButton("Close")
+        btn_row.addWidget(btn_close)
+        root.addLayout(btn_row)
+
+        if hasattr(self, 'stream_input'):
+            source_input.setText(self.stream_input.currentText().strip())
+
+        def refresh_list():
+            list_widget.clear()
+            active_row = -1
+            for idx, profile in enumerate(self.source_profiles):
+                name = profile.get('name') or self._display_name_for_source(profile.get('source'))
+                stype = profile.get('source_type', 'source')
+                src = profile.get('source')
+                item = QListWidgetItem(f"{name} [{stype}]\n{src}")
+                item.setData(Qt.UserRole, profile.get('id'))
+                list_widget.addItem(item)
+                if profile.get('id') == self.active_source_profile_id:
+                    active_row = idx
+            if active_row >= 0:
+                list_widget.setCurrentRow(active_row)
+
+        def add_manual_source():
+            raw = source_input.text().strip()
+            if not raw:
+                status.setText("Enter a source first")
+                return
+            source = int(raw) if raw.isdigit() else raw
+            self._upsert_source_profile(source, source_type=self._infer_source_type(source), auto_select=True)
+            refresh_list()
+            self.schedule_settings_save()
+            status.setText("Source added")
+
+        def add_current_source():
+            if self.video_source is None:
+                raw = source_input.text().strip()
+                if not raw:
+                    status.setText("No current source to add")
+                    return
+                source = int(raw) if raw.isdigit() else raw
+            else:
+                source = self.video_source
+            self._upsert_source_profile(source, source_type=self._infer_source_type(source), auto_select=True)
+            refresh_list()
+            self.schedule_settings_save()
+            status.setText("Current source added")
+
+        def remove_selected_source():
+            row = list_widget.currentRow()
+            if row < 0 or row >= len(self.source_profiles):
+                status.setText("Select a source first")
+                return
+            removed = self.source_profiles.pop(row)
+            if removed.get('id') == self.active_source_profile_id:
+                self.active_source_profile_id = None
+            refresh_list()
+            self._refresh_source_profiles_ui()
+            self.schedule_settings_save()
+            status.setText("Source removed")
+
+        def open_selected_source():
+            row = list_widget.currentRow()
+            if row < 0 or row >= len(self.source_profiles):
+                status.setText("Select a source first")
+                return
+            profile = self.source_profiles[row]
+            self.active_source_profile_id = profile.get('id')
+            self.video_source = profile.get('source')
+            self._apply_source_profile_settings(profile.get('settings', {}))
+            self._refresh_runtime_overview()
+            self.btn_start.setEnabled(True)
+            self.show_player_view()
+            dialog.accept()
+            QTimer.singleShot(0, self.start_processing)
+
+        btn_add_source.clicked.connect(add_manual_source)
+        btn_add_current.clicked.connect(add_current_source)
+        btn_remove.clicked.connect(remove_selected_source)
+        btn_open.clicked.connect(open_selected_source)
+        btn_close.clicked.connect(dialog.reject)
+
+        refresh_list()
+        dialog.exec_()
+
+    def show_admin_dashboard(self):
+        if hasattr(self, 'main_view_stack'):
+            self.main_view_stack.setCurrentIndex(0)
+        self.video_title_label.setText("Camera Admin Dashboard")
+        
+        # Fix: Apply grid layout AFTER widget is visible and rendered
+        QTimer.singleShot(50, lambda: self._apply_admin_source_grid_columns(refresh_cards=True))
+        
+        if hasattr(self, 'stream_group'):
+            self.stream_group.setVisible(True)
+        if hasattr(self, 'source_hub_group'):
+            self.source_hub_group.setVisible(True)
+        if hasattr(self, 'status_panel'):
+            self.status_panel.setVisible(False)
+        if hasattr(self, 'btn_load_video'):
+            self.btn_load_video.setVisible(False)
+        if hasattr(self, 'btn_start'):
+            self.btn_start.setVisible(False)
+        if hasattr(self, 'btn_stop'):
+            self.btn_stop.setVisible(False)
+        if hasattr(self, 'btn_toggle_sidebar'):
+            self.btn_toggle_sidebar.setVisible(False)
+        if hasattr(self, 'scroll_area'):
+            self.scroll_area.setVisible(False)
+
+    def show_player_view(self):
+        if hasattr(self, 'main_view_stack'):
+            self.main_view_stack.setCurrentIndex(1)
+        self.video_title_label.setText("Live View")
+        # Keep player focused: source creation/management is only on Source Page.
+        if hasattr(self, 'stream_group'):
+            self.stream_group.setVisible(False)
+        if hasattr(self, 'source_hub_group'):
+            self.source_hub_group.setVisible(False)
+        if hasattr(self, 'status_panel'):
+            self.status_panel.setVisible(True)
+        if hasattr(self, 'btn_load_video'):
+            self.btn_load_video.setVisible(True)
+        if hasattr(self, 'btn_start'):
+            self.btn_start.setVisible(True)
+        if hasattr(self, 'btn_stop'):
+            self.btn_stop.setVisible(True)
+        if hasattr(self, 'btn_toggle_sidebar'):
+            self.btn_toggle_sidebar.setVisible(True)
+            self.btn_toggle_sidebar.setText("Mo Cau Hinh")
+        if hasattr(self, 'scroll_area'):
+            self.scroll_area.setVisible(False)
+
+    def refresh_admin_source_cards(self):
+        if not hasattr(self, 'admin_source_list'):
+            return
+
+        self.admin_source_list.blockSignals(True)
+        self.admin_source_list.clear()
+        self.admin_row_profile_ids = []
+        active_row = -1
+
+        display_profiles = list(self.source_profiles)
+        if self.pin_active_source_first and self.active_source_profile_id is not None:
+            display_profiles.sort(key=lambda p: 0 if p.get('id') == self.active_source_profile_id else 1)
+
+        for idx, profile in enumerate(display_profiles):
+            title = profile.get('name') or self._display_name_for_source(profile.get('source'))
+            source_type = profile.get('source_type', 'source')
+            source = profile.get('source')
+            source_key = self._source_to_key(source)
+            is_active = profile.get('id') == self.active_source_profile_id
+            compact_title = " ".join(str(title).split())
+            size_factor = {"Small": 6.8, "Medium": 6.2, "Large": 5.8}.get(self.source_tile_text_size, 6.2)
+            max_chars = max(18, min(46, int(self.preview_width / size_factor)))
+            if len(compact_title) > max_chars:
+                compact_title = compact_title[:max_chars - 3] + "..."
+            item_title = f"ACTIVE | {compact_title}" if is_active else compact_title
+            item = QListWidgetItem(f"{item_title}\n{source_type.upper()}")
+            preview = self.source_preview_cache.get(source_key)
+            if preview is None:
+                preview = self._create_placeholder_preview("LOADING")
+                self._enqueue_preview_load(source)
+            item.setIcon(QIcon(preview))
+            item.setData(Qt.UserRole, profile.get('id'))
+            item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            item.setToolTip(f"{title}\nType: {source_type}\nSource: {source}")
+            if is_active:
+                item.setBackground(QColor("#dcfce7"))
+                item.setForeground(QColor("#14532d"))
+            else:
+                item.setBackground(QColor("#fffdf8"))
+                item.setForeground(QColor("#374151"))
+            self.admin_source_list.addItem(item)
+            self.admin_row_profile_ids.append(profile.get('id'))
+            if is_active:
+                active_row = idx
+
+        if active_row >= 0:
+            self.admin_source_list.setCurrentRow(active_row)
+        self.admin_source_list.blockSignals(False)
+        self._update_admin_open_button_state()
+
+        if self.preview_load_queue and not self.preview_loader_timer.isActive():
+            self.preview_loader_timer.start(15)
+
+    def _update_admin_open_button_state(self):
+        if not hasattr(self, 'btn_admin_open_source') or not hasattr(self, 'admin_source_list'):
+            return
+        row = self.admin_source_list.currentRow()
+        has_valid_selection = 0 <= row < len(getattr(self, 'admin_row_profile_ids', []))
+        self.btn_admin_open_source.setEnabled(has_valid_selection)
+        if hasattr(self, 'btn_admin_rename_source'):
+            self.btn_admin_rename_source.setEnabled(has_valid_selection)
+        if hasattr(self, 'btn_admin_delete_source'):
+            self.btn_admin_delete_source.setEnabled(has_valid_selection)
+
+    def on_admin_source_selected(self, row):
+        if row < 0 or row >= len(getattr(self, 'admin_row_profile_ids', [])):
+            if hasattr(self, 'admin_name_input'):
+                self.admin_name_input.setText("")
+            self._update_admin_open_button_state()
+            return
+
+        profile_id = self.admin_row_profile_ids[row]
+        profile = next((p for p in self.source_profiles if p.get('id') == profile_id), None)
+        if profile is None:
+            self._update_admin_open_button_state()
+            return
+
+        self.active_source_profile_id = profile.get('id')
+        if hasattr(self, 'admin_name_input'):
+            self.admin_name_input.setText(profile.get('name') or "")
+        if hasattr(self, 'source_profile_status'):
+            self.source_profile_status.setText(f"Selected: {profile.get('name')}")
+        self._update_admin_open_button_state()
+
+    def _capture_runtime_preview_for_active_source(self, frame):
+        if frame is None or self.video_source is None:
+            return
+        now = time.perf_counter()
+
+        source_key = self._source_to_key(self.video_source)
+        meta = self.source_preview_meta.get(source_key, {})
+        if meta.get('kind') == 'real':
+            return
+        if (now - self.last_preview_capture_ts) < self.preview_capture_interval:
+            return
+
+        pixmap = self._preview_pixmap_from_bgr_frame(frame)
+        if pixmap is None:
+            return
+
+        self.source_preview_cache[source_key] = pixmap
+        self.source_preview_meta[source_key] = {'kind': 'real', 'ts': time.time(), 'via': 'runtime'}
+        self.preview_retry_after.pop(source_key, None)
+        self.last_preview_capture_ts = now
+        self._update_admin_card_preview_icon(source_key, pixmap)
+
+    def show_admin_source_context_menu(self, pos):
+        if not hasattr(self, 'admin_source_list'):
+            return
+
+        item = self.admin_source_list.itemAt(pos)
+        if item is None:
+            return
+
+        row = self.admin_source_list.row(item)
+        if row < 0 or row >= len(self.source_profiles):
+            return
+
+        self.admin_source_list.setCurrentRow(row)
+
+        menu = QMenu(self)
+        rename_action = menu.addAction("Doi ten")
+        change_source_action = menu.addAction("Doi nguon")
+        delete_action = menu.addAction("Xoa nguon")
+        selected_action = menu.exec_(self.admin_source_list.mapToGlobal(pos))
+
+        if selected_action == rename_action:
+            self.rename_admin_source_from_menu(row)
+        elif selected_action == change_source_action:
+            self.change_admin_source_from_menu(row)
+        elif selected_action == delete_action:
+            self.remove_admin_source_from_menu(row)
+
+    def rename_admin_source_from_menu(self, row):
+        if row < 0 or row >= len(getattr(self, 'admin_row_profile_ids', [])):
+            return
+
+        profile_id = self.admin_row_profile_ids[row]
+        source_row = next((idx for idx, p in enumerate(self.source_profiles) if p.get('id') == profile_id), -1)
+        if source_row < 0:
+            return
+
+        profile = self.source_profiles[source_row]
+        current_name = profile.get('name') or self._display_name_for_source(profile.get('source'))
+        new_name, ok = QInputDialog.getText(self, "Doi ten nguon", "Ten moi:", text=str(current_name))
+        if not ok:
+            return
+
+        new_name = (new_name or "").strip()
+        if not new_name:
+            if hasattr(self, 'source_profile_status'):
+                self.source_profile_status.setText("Ten khong duoc de trong")
+            return
+
+        self.source_profiles[source_row]['name'] = new_name
+        self._refresh_source_profiles_ui()
+        self.schedule_settings_save()
+        if hasattr(self, 'source_profile_status'):
+            self.source_profile_status.setText(f"Da doi ten: {new_name}")
+
+    def change_admin_source_from_menu(self, row):
+        if row < 0 or row >= len(getattr(self, 'admin_row_profile_ids', [])):
+            return
+
+        profile_id = self.admin_row_profile_ids[row]
+        source_row = next((idx for idx, p in enumerate(self.source_profiles) if p.get('id') == profile_id), -1)
+        if source_row < 0:
+            return
+
+        profile = self.source_profiles[source_row]
+        old_source = profile.get('source')
+        current_value = str(old_source)
+        new_raw, ok = QInputDialog.getText(self, "Doi nguon", "Nguon moi (URL/camera id/file):", text=current_value)
+        if not ok:
+            return
+
+        new_raw = (new_raw or "").strip()
+        if not new_raw:
+            if hasattr(self, 'source_profile_status'):
+                self.source_profile_status.setText("Nguon moi khong hop le")
+            return
+
+        new_source = int(new_raw) if new_raw.isdigit() else new_raw
+        dup_idx = self._find_source_profile_index(new_source)
+        if dup_idx >= 0 and dup_idx != source_row:
+            if hasattr(self, 'source_profile_status'):
+                self.source_profile_status.setText("Trung nguon: da ton tai profile khac")
+            return
+
+        old_key = self._source_to_key(old_source)
+        new_key = self._source_to_key(new_source)
+
+        current_name = profile.get('name') or ""
+        auto_name_old = self._display_name_for_source(old_source)
+
+        profile['source'] = new_source
+        profile['source_key'] = new_key
+        profile['source_type'] = self._infer_source_type(new_source)
+        if not current_name or current_name == auto_name_old:
+            profile['name'] = self._display_name_for_source(new_source)
+
+        self.source_preview_cache.pop(old_key, None)
+        self.source_preview_cache.pop(new_key, None)
+
+        self._refresh_source_profiles_ui()
+        self.admin_source_list.setCurrentRow(row)
+        self.schedule_settings_save()
+        if hasattr(self, 'source_profile_status'):
+            self.source_profile_status.setText("Da cap nhat nguon")
+
+    def remove_admin_source_from_menu(self, row):
+        if row < 0 or row >= len(getattr(self, 'admin_row_profile_ids', [])):
+            return
+
+        profile_id = self.admin_row_profile_ids[row]
+        source_row = next((idx for idx, p in enumerate(self.source_profiles) if p.get('id') == profile_id), -1)
+        if source_row < 0:
+            return
+
+        removed = self.source_profiles.pop(source_row)
+        removed_source = removed.get('source')
+        removed_key = self._source_to_key(removed_source)
+
+        self.source_preview_cache.pop(removed_key, None)
+        self.source_preview_meta.pop(removed_key, None)
+        self.preview_retry_after.pop(removed_key, None)
+
+        was_active = removed.get('id') == self.active_source_profile_id
+        if was_active:
+            self.active_source_profile_id = None
+
+        is_current_source = False
+        if self.video_source is not None:
+            try:
+                is_current_source = self._source_to_key(self.video_source) == removed_key
+            except Exception:
+                is_current_source = False
+
+        if is_current_source:
+            if self.video_thread and self.video_thread.isRunning():
+                self.stop_processing()
+            self.video_source = None
+            if hasattr(self, 'btn_start'):
+                self.btn_start.setEnabled(False)
+
+        self._refresh_source_profiles_ui()
+        self.refresh_admin_source_cards()
+        self._refresh_runtime_overview()
+        self.schedule_settings_save()
+        if hasattr(self, 'source_profile_status'):
+            self.source_profile_status.setText("Da xoa nguon")
+
+    def delete_selected_admin_source(self):
+        """Xoa nguon duoc chon tu nut Xoa Nguon"""
+        if not hasattr(self, 'admin_source_list'):
+            return
+        
+        row = self.admin_source_list.currentRow()
+        if row < 0 or row >= len(getattr(self, 'admin_row_profile_ids', [])):
+            if hasattr(self, 'source_profile_status'):
+                self.source_profile_status.setText("Chon nguon de xoa")
+            return
+        
+        # Xac nhan truoc khi xoa
+        profile_id = self.admin_row_profile_ids[row]
+        profile = next((p for p in self.source_profiles if p.get('id') == profile_id), None)
+        if profile is None:
+            return
+        
+        source_name = profile.get('name') or self._display_name_for_source(profile.get('source'))
+        
+        from PyQt5.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, 
+            'Xac nhan xoa', 
+            f'Ban co chac chan muon xoa nguon "{source_name}"?',
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.remove_admin_source_from_menu(row)
+
+    def open_selected_admin_source(self):
+        if not hasattr(self, 'admin_source_list'):
+            return
+        row = self.admin_source_list.currentRow()
+        if row < 0 or row >= len(getattr(self, 'admin_row_profile_ids', [])):
+            if hasattr(self, 'source_profile_status'):
+                self.source_profile_status.setText("Select a source profile first")
+            return
+
+        profile_id = self.admin_row_profile_ids[row]
+        source_row = next((idx for idx, p in enumerate(self.source_profiles) if p.get('id') == profile_id), -1)
+        if source_row < 0:
+            return
+
+        if hasattr(self, 'source_list_widget'):
+            self.source_list_widget.setCurrentRow(source_row)
+        self.open_selected_source_profile()
+
+    def _refresh_source_profiles_ui(self):
+        self.source_list_widget.blockSignals(True)
+        self.source_list_widget.clear()
+
+        active_row = -1
+        for idx, profile in enumerate(self.source_profiles):
+            title = profile.get('name') or self._display_name_for_source(profile.get('source'))
+            source_type = profile.get('source_type', 'source')
+            item = QListWidgetItem(f"{title}  [{source_type}]")
+            item.setData(Qt.UserRole, profile.get('id'))
+            self.source_list_widget.addItem(item)
+            if profile.get('id') == self.active_source_profile_id:
+                active_row = idx
+
+        if active_row >= 0:
+            self.source_list_widget.setCurrentRow(active_row)
+
+        self.source_list_widget.blockSignals(False)
+
+        if self.source_profiles:
+            self.source_profile_status.setText(f"{len(self.source_profiles)} sources ready")
+        else:
+            self.source_profile_status.setText("No source profiles yet")
+        self.refresh_admin_source_cards()
+
+    def _upsert_source_profile(self, source, source_type="source", auto_select=True, display_name=None):
+        if source is None or str(source).strip() == "":
+            return
+
+        # Compute source key for duplicate detection
+        source_key = self._source_to_key(source)
+        
+        # Find existing profile - use computed key for safety
+        idx = -1
+        for i, profile in enumerate(self.source_profiles):
+            profile_key = profile.get('source_key')
+            if not profile_key:
+                profile_source = profile.get('source')
+                if profile_source is not None:
+                    profile_key = self._source_to_key(profile_source)
+                    profile['source_key'] = profile_key
+            if profile_key and profile_key == source_key:
+                idx = i
+                break
+        
+        payload = self._capture_source_profile_settings()
+
+        if idx >= 0:
+            # Update existing profile
+            self.source_profiles[idx]['settings'] = payload
+            self.source_profiles[idx]['source_type'] = source_type
+            if display_name is not None:
+                self.source_profiles[idx]['name'] = display_name
+            profile_id = self.source_profiles[idx]['id']
+        else:
+            # Create new profile
+            profile_id = self.source_profile_counter
+            self.source_profile_counter += 1
+            self.source_profiles.append({
+                'id': profile_id,
+                'source': source,
+                'source_key': source_key,
+                'source_type': source_type,
+                'name': display_name if display_name else self._display_name_for_source(source),
+                'settings': payload,
+            })
+
+        if auto_select:
+            self.active_source_profile_id = profile_id
+        self._refresh_source_profiles_ui()
+
+    def rename_selected_admin_source(self):
+        if not hasattr(self, 'admin_source_list') or not hasattr(self, 'admin_name_input'):
+            return
+        row = self.admin_source_list.currentRow()
+        if row < 0 or row >= len(self.source_profiles):
+            if hasattr(self, 'source_profile_status'):
+                self.source_profile_status.setText("Chon nguon truoc khi doi ten")
+            return
+
+        new_name = self.admin_name_input.text().strip()
+        if not new_name:
+            if hasattr(self, 'source_profile_status'):
+                self.source_profile_status.setText("Nhap ten moi")
+            return
+
+        self.source_profiles[row]['name'] = new_name
+        self._refresh_source_profiles_ui()
+        self.schedule_settings_save()
+        if hasattr(self, 'source_profile_status'):
+            self.source_profile_status.setText(f"Da luu ten: {new_name}")
+
+    def add_current_source_profile(self):
+        """Add current source into admin list with current settings."""
+        if hasattr(self, 'main_view_stack') and self.main_view_stack.currentIndex() != 0:
+            self.source_profile_status.setText("Open Source Page to add new sources")
+            self.show_admin_dashboard()
+            return
+
+        if not self.video_source:
+            self.source_profile_status.setText("No source to add")
+            return
+
+        source = self.video_source
+
+        source_type = self._infer_source_type(source)
+
+        self._upsert_source_profile(source, source_type=source_type, auto_select=True)
+        self.source_profile_status.setText("Source profile added")
+        self.schedule_settings_save()
+
+    def on_source_profile_selected(self, row):
+        if row < 0 or row >= len(self.source_profiles):
+            return
+        profile = self.source_profiles[row]
+        self.active_source_profile_id = profile.get('id')
+        self.source_profile_status.setText(f"Selected: {profile.get('name')}")
+
+    def open_selected_source_profile(self):
+        row = self.source_list_widget.currentRow()
+        if row < 0 or row >= len(self.source_profiles):
+            self.source_profile_status.setText("Select a source profile first")
+            return
+
+        profile = self.source_profiles[row]
+        self.active_source_profile_id = profile.get('id')
+        self.video_source = profile.get('source')
+        self._apply_source_profile_settings(profile.get('settings', {}))
+        self._refresh_runtime_overview()
+        self.btn_start.setEnabled(True)
+        self.status_label.setText(f"Source ready: {profile.get('name')}")
+        self.show_player_view()
+
+        # Let UI settle before heavy startup to reduce launch hitch.
+        QTimer.singleShot(0, self.start_processing)
+
+    def update_selected_source_profile(self):
+        row = self.source_list_widget.currentRow()
+        if row < 0 or row >= len(self.source_profiles):
+            self.source_profile_status.setText("Select a source profile first")
+            return
+
+        self.source_profiles[row]['settings'] = self._capture_source_profile_settings()
+        self.source_profile_status.setText("Source profile updated")
+        self.schedule_settings_save()
+
+    def remove_selected_source_profile(self):
+        row = self.source_list_widget.currentRow()
+        if row < 0 or row >= len(self.source_profiles):
+            self.source_profile_status.setText("Select a source profile first")
+            return
+
+        removed = self.source_profiles.pop(row)
+        removed_key = self._source_to_key(removed.get('source'))
+        self.source_preview_cache.pop(removed_key, None)
+        self.source_preview_meta.pop(removed_key, None)
+        self.preview_retry_after.pop(removed_key, None)
+        if removed.get('id') == self.active_source_profile_id:
+            self.active_source_profile_id = None
+        self._refresh_source_profiles_ui()
+        self.source_profile_status.setText("Source profile removed")
+        self.schedule_settings_save()
     
     def save_stream_to_history(self, url: str):
         """Save stream URL to history"""
         if not url or url.strip() == "":
             return
+
+        normalized_new = self._source_to_key(url)
         
         # Remove if already exists (to move to top)
-        index = self.stream_input.findText(url)
-        if index >= 0:
-            self.stream_input.removeItem(index)
+        for idx in range(self.stream_input.count() - 1, -1, -1):
+            item_text = self.stream_input.itemText(idx)
+            if self._source_to_key(item_text) == normalized_new:
+                self.stream_input.removeItem(idx)
         
         # Add to top
-        self.stream_input.insertItem(0, url)
+        self.stream_input.insertItem(0, url.strip())
         self.stream_input.setCurrentIndex(0)
         
         # Keep only 5 items
@@ -3510,7 +5423,7 @@ def _ensure_python310_runtime() -> bool:
 
 
 def main():
-    """Main entry point"""
+    """Main entry point with splash screen"""
     if not _ensure_python310_runtime():
         return
 
@@ -3519,8 +5432,29 @@ def main():
     # Set dark theme
     app.setStyle('Fusion')
     
+    # Show splash screen
+    splash = ModernSplashScreen()
+    splash.show()
+    splash.set_progress(10, "Loading application...")
+    QApplication.processEvents()
+    
+    # Simulate loading steps with progress
+    splash.set_progress(30, "Initializing UI components...")
+    QApplication.processEvents()
+    
+    # Create main window
+    splash.set_progress(50, "Loading detection models...")
     window = MainWindow()
+    
+    splash.set_progress(80, "Preparing interface...")
+    QApplication.processEvents()
+    
+    # Show main window
+    splash.set_progress(100, "Ready!")
     window.show()
+    
+    # Close splash after a short delay
+    QTimer.singleShot(500, splash.close)
     
     sys.exit(app.exec_())
 
