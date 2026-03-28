@@ -4,9 +4,9 @@
   "tracker_choice": "SORT (Fast)",
   "confidence": 25,
   "duplicate_iou_threshold": 55,
-  "box_thickness": 2,
-  "font_size": 20,
-  "font_thickness": 2,
+  "box_thickness": 3,
+  "font_size": 36,
+  "font_thickness": 3,
   "display_point_mode": false,
   "trail_enabled": true,
   "max_det": 12,
@@ -24,7 +24,7 @@
     {
       "id": 1,
       "source": "rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/2701",
-      "source_key": "rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/2701",
+      "source_key": "url:rtsp://hctech:admin@789@kcndd.cameraddns.net:554/Streaming/channels/2701",
       "source_type": "rtsp",
       "name": "Chay nhanh RTSP",
       "settings": {
@@ -42,7 +42,7 @@
     {
       "id": 2,
       "source": "https://www.youtube.com/watch?v=1EiC9bvVGnk",
-      "source_key": "https://www.youtube.com/watch?v=1EiC9bvVGnk",
+      "source_key": "url:https://www.youtube.com/watch?v=1EiC9bvVGnk",
       "source_type": "youtube",
       "name": "OTo n\u01b0\u1edbc ngo\u00e0i",
       "settings": {
@@ -60,7 +60,7 @@
     {
       "id": 3,
       "source": "https://www.youtube.com/watch?v=G_G8A6JU_LI",
-      "source_key": "https://www.youtube.com/watch?v=G_G8A6JU_LI",
+      "source_key": "url:https://www.youtube.com/watch?v=G_G8A6JU_LI",
       "source_type": "youtube",
       "name": "Vn1",
       "settings": {
@@ -78,7 +78,7 @@
     {
       "id": 4,
       "source": "https://www.youtube.com/watch?v=_50Wd2b5Qyo",
-      "source_key": "https://www.youtube.com/watch?v=_50Wd2b5Qyo",
+      "source_key": "url:https://www.youtube.com/watch?v=_50Wd2b5Qyo",
       "source_type": "youtube",
       "name": "Vn Cong truog",
       "settings": {
@@ -96,7 +96,7 @@
     {
       "id": 5,
       "source": "https://www.youtube.com/watch?v=sJvEFrG0wq0",
-      "source_key": "https://www.youtube.com/watch?v=sJvEFrG0wq0",
+      "source_key": "url:https://www.youtube.com/watch?v=sJvEFrG0wq0",
       "source_type": "youtube",
       "name": "VN Cong tr\u01b0\u1eddng 2",
       "settings": {
@@ -112,29 +112,11 @@
       }
     },
     {
-      "id": 10,
-      "source": "https://www.youtube.com/watch?v=sJvEFrG0wq0",
-      "source_key": "url:https://www.youtube.com/watch?v=sJvEFrG0wq0",
-      "source_type": "youtube",
-      "name": "Web Stream",
-      "settings": {
-        "model_choice": "Custom model...",
-        "tracker_choice": "SORT (Fast)",
-        "confidence": 25,
-        "duplicate_iou_threshold": 55,
-        "max_det": 12,
-        "tracker_age": 1,
-        "resize_scale": "100% (Full Quality)",
-        "display_point_mode": false,
-        "trail_enabled": true
-      }
-    },
-    {
-      "id": 11,
-      "source": "https://www.youtube.com/watch?v=1EiC9bvVGnk",
-      "source_key": "url:https://www.youtube.com/watch?v=1EiC9bvVGnk",
-      "source_type": "youtube",
-      "name": "Web Stream",
+      "id": 12,
+      "source": "rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/1201",
+      "source_key": "url:rtsp://hctech:admin@789@kcndd.cameraddns.net:554/Streaming/channels/1201",
+      "source_type": "rtsp",
+      "name": "RTPS 2",
       "settings": {
         "model_choice": "Custom model...",
         "tracker_choice": "SORT (Fast)",
@@ -148,15 +130,15 @@
       }
     }
   ],
-  "source_profile_counter": 12,
-  "active_source_profile_id": 1,
+  "source_profile_counter": 14,
+  "active_source_profile_id": 12,
   "source_grid_columns": 4,
   "source_tile_text_size": "Medium",
   "pin_active_source_first": true,
   "roi_threshold": 50,
   "roi_visible": true,
   "roi_config": null,
-  "vehicle_alert_limit": 31,
+  "vehicle_alert_limit": 87,
   "vehicle_alert_scope": "AUTO",
   "sidebar_visible": false,
   "runtime_expanded": false

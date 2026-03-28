@@ -19,11 +19,11 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFileDialog, QLineEdit, QGroupBox, QGridLayout, QTextEdit,
                              QDialog, QProgressBar, QListWidget, QListWidgetItem, QToolButton,
                              QScrollArea, QFrame, QSizePolicy, QOpenGLWidget, QStackedWidget,
-                             QMenu, QInputDialog, QCheckBox, QSplashScreen)
+                             QMenu, QInputDialog, QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QSize
 from PyQt5.QtGui import (
     QImage, QPixmap, QFont, QPainter, QColor,
-    QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture, QIcon, QLinearGradient
+    QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture, QIcon
 )
 import time
 from pathlib import Path
@@ -40,79 +40,6 @@ class AppState:
     best_model_choice = "None (Use base YOLO only)"
 
 app_state = AppState()
-
-
-class ModernSplashScreen(QSplashScreen):
-    """Beautiful splash screen with loading animation"""
-    
-    def __init__(self):
-        # Create splash pixmap
-        pixmap = QPixmap(600, 400)
-        pixmap.fill(Qt.transparent)
-        super().__init__(pixmap, Qt.WindowStaysOnTopHint)
-        
-        self.progress = 0
-        self.message = "Initializing..."
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
-        
-    def drawContents(self, painter):
-        """Custom paint for modern splash screen"""
-        painter.setRenderHint(QPainter.Antialiasing)
-        
-        # Background gradient
-        gradient = QLinearGradient(0, 0, 0, 400)
-        gradient.setColorAt(0, QColor(15, 23, 42))  # slate-900
-        gradient.setColorAt(1, QColor(30, 41, 59))  # slate-800
-        painter.fillRect(0, 0, 600, 400, gradient)
-        
-        # App title
-        painter.setPen(QColor(255, 255, 255))
-        painter.setFont(QFont("Segoe UI", 28, QFont.Bold))
-        painter.drawText(0, 80, 600, 60, Qt.AlignCenter, "🚗 Vehicle Tracking")
-        
-        # Subtitle
-        painter.setPen(QColor(148, 163, 184))  # slate-400
-        painter.setFont(QFont("Segoe UI", 12))
-        painter.drawText(0, 140, 600, 30, Qt.AlignCenter, "Real-time Object Detection & Counting")
-        
-        # Progress bar background
-        bar_x, bar_y = 100, 250
-        bar_width, bar_height = 400, 8
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(51, 65, 85))  # slate-700
-        painter.drawRoundedRect(bar_x, bar_y, bar_width, bar_height, 4, 4)
-        
-        # Progress bar fill
-        if self.progress > 0:
-            fill_width = int(bar_width * self.progress / 100)
-            gradient_bar = QLinearGradient(bar_x, bar_y, bar_x + fill_width, bar_y)
-            gradient_bar.setColorAt(0, QColor(34, 197, 94))  # green-500
-            gradient_bar.setColorAt(1, QColor(22, 163, 74))  # green-600
-            painter.setBrush(gradient_bar)
-            painter.drawRoundedRect(bar_x, bar_y, fill_width, bar_height, 4, 4)
-        
-        # Progress text
-        painter.setPen(QColor(226, 232, 240))  # slate-200
-        painter.setFont(QFont("Segoe UI", 10))
-        painter.drawText(0, 280, 600, 30, Qt.AlignCenter, f"{self.progress}%")
-        
-        # Status message
-        painter.setPen(QColor(148, 163, 184))  # slate-400
-        painter.setFont(QFont("Segoe UI", 9))
-        painter.drawText(0, 310, 600, 30, Qt.AlignCenter, self.message)
-        
-        # Version/footer
-        painter.setPen(QColor(100, 116, 139))  # slate-500
-        painter.setFont(QFont("Segoe UI", 8))
-        painter.drawText(0, 360, 600, 30, Qt.AlignCenter, "Powered by YOLO • PyQt5 • OpenCV")
-    
-    def set_progress(self, value, message=""):
-        """Update progress and message"""
-        self.progress = min(100, max(0, value))
-        if message:
-            self.message = message
-        self.repaint()
-        QApplication.processEvents()
 
 
 class SharedFrameStore:
@@ -1000,12 +927,6 @@ class MainWindow(QMainWindow):
         self.btn_admin_open_source.setEnabled(False)
         admin_btn_row.addWidget(self.btn_admin_open_source)
 
-        self.btn_admin_delete_source = QPushButton("Xoa Nguon")
-        self.btn_admin_delete_source.setObjectName("dangerAction")
-        self.btn_admin_delete_source.clicked.connect(self.delete_selected_admin_source)
-        self.btn_admin_delete_source.setEnabled(False)
-        admin_btn_row.addWidget(self.btn_admin_delete_source)
-
         self.btn_admin_refresh_sources = QPushButton("Lam Moi Preview")
         self.btn_admin_refresh_sources.setObjectName("secondaryAction")
         self.btn_admin_refresh_sources.clicked.connect(self.refresh_admin_source_previews)
@@ -1034,7 +955,7 @@ class MainWindow(QMainWindow):
 
         self.main_view_stack.addWidget(admin_page)
         self.main_view_stack.addWidget(player_page)
-        left_panel.addWidget(self.main_view_stack)
+        left_panel.addWidget(self.main_view_stack, 1)
         
         # New Consolidated Status Dashboard
         self._setup_status_panel(left_panel)
@@ -1060,6 +981,10 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.btn_stop)
         
         left_panel.addLayout(button_layout)
+        # Keep live video area dominant; status row remains compact.
+        left_panel.setStretch(0, 12)
+        left_panel.setStretch(1, 0)
+        left_panel.setStretch(2, 0)
         
         # Right panel - Controls and stats
         right_panel = QVBoxLayout()
@@ -3075,6 +3000,7 @@ class MainWindow(QMainWindow):
         )
         
         if file_path:
+            self._cancel_pending_stream_resolve()
             self.video_source = file_path
             self._upsert_source_profile(file_path, source_type="file", auto_select=True)
             self.status_label.setText(f"Loaded: {Path(file_path).name}")
@@ -3101,6 +3027,7 @@ class MainWindow(QMainWindow):
             
         # Check if webcam ID
         if stream_url.isdigit():
+            self._cancel_pending_stream_resolve()
             self.video_source = int(stream_url)
             self._upsert_source_profile(self.video_source, source_type="camera", auto_select=True)
         else:
@@ -3110,6 +3037,7 @@ class MainWindow(QMainWindow):
                 self._start_youtube_resolve(stream_url)
                 return
             else:
+                self._cancel_pending_stream_resolve()
                 self.video_source = stream_url
                 source_type = "rtsp" if stream_url.lower().startswith("rtsp://") else "stream"
                 self._upsert_source_profile(self.video_source, source_type=source_type, auto_select=True)
@@ -3117,26 +3045,37 @@ class MainWindow(QMainWindow):
                 
         self.start_processing()
 
+    def _cancel_pending_stream_resolve(self):
+        """Ignore stale async YouTube resolve callbacks after source changed."""
+        self.pending_youtube_source = None
+
     def _on_stream_resolve_progress(self, message: str):
+        if not self.pending_youtube_source:
+            return
         if message:
             self.status_label.setText(message)
 
     def _on_stream_resolved(self, resolved_source, status_text: str):
+        if not self.pending_youtube_source:
+            return
+        requested_source = self.pending_youtube_source
         self.video_source = resolved_source
-        if self.pending_youtube_source:
-            self._upsert_source_profile(self.pending_youtube_source, source_type="youtube", auto_select=True)
+        self._upsert_source_profile(requested_source, source_type="youtube", auto_select=True)
         self.status_label.setText(status_text)
         self._refresh_runtime_overview()
         self.start_processing()
 
     def _on_stream_resolve_failed(self, error_text: str):
+        if not self.pending_youtube_source:
+            return
         self.status_label.setText(f"❌ Error: {error_text[:120]}")
         print(f"Full error: {error_text}")
 
     def _on_stream_resolve_finished(self):
         self.pending_youtube_source = None
-        self.btn_start_stream.setEnabled(not self.models_loading)
-        self.btn_start.setEnabled((not self.models_loading) and bool(self.video_source) and bool(self.processor))
+        is_processing = bool(self.video_thread and self.video_thread.isRunning())
+        self.btn_start_stream.setEnabled((not self.models_loading) and (not is_processing))
+        self.btn_start.setEnabled((not self.models_loading) and bool(self.video_source) and bool(self.processor) and (not is_processing))
         if self.stream_resolver_thread:
             self.stream_resolver_thread.deleteLater()
             self.stream_resolver_thread = None
@@ -3160,6 +3099,21 @@ class MainWindow(QMainWindow):
         self.stream_resolver_thread.finished.connect(self._on_stream_resolve_finished)
         self.stream_resolver_thread.start()
         return True
+
+    def _reset_runtime_frame_state(self, clear_widget=False, widget_message=None):
+        """Reset frame handoff state so old-source frames cannot leak into new source."""
+        self.shared_frame_store = SharedFrameStore()
+        self.pending_frame_version = 0
+        self.metrics_last_version = 0
+        self.pending_display_frame = None
+        self.pending_display_stats = {'total_objects': 0, 'class_counts': {}}
+        self.pending_frame_dirty = False
+        self.last_preview_capture_ts = 0.0
+        if clear_widget and hasattr(self, 'video_label'):
+            if hasattr(self.video_label, 'clear_frame'):
+                self.video_label.clear_frame()
+            if widget_message is not None and hasattr(self.video_label, 'setText'):
+                self.video_label.setText(widget_message)
         
     def start_processing(self):
         """Start video processing"""
@@ -3179,6 +3133,7 @@ class MainWindow(QMainWindow):
             if ('youtube.com' in source_text) or ('youtu.be' in source_text):
                 self._start_youtube_resolve(self.video_source)
                 return
+        self._cancel_pending_stream_resolve()
 
         self.show_player_view()
 
@@ -3202,7 +3157,7 @@ class MainWindow(QMainWindow):
             
         # Stop existing thread if running
         if self.video_thread and self.video_thread.isRunning():
-            self.stop_processing()
+            self.stop_processing(clear_display=True)
             
         # Get parameters
         frame_skip = 0
@@ -3216,6 +3171,7 @@ class MainWindow(QMainWindow):
         
         # Reset processor statistics
         self.processor.reset_statistics()
+        self._reset_runtime_frame_state(clear_widget=True)
         
         # Create and start thread
         self.video_thread = VideoThread()
@@ -3248,15 +3204,6 @@ class MainWindow(QMainWindow):
         self.last_adaptive_tune_time = 0.0
         self.last_fps_color = ""
         self.last_stats_text = ""
-        self.shared_frame_store.clear()
-        self.pending_frame_version = 0
-        self.metrics_last_version = 0
-        self.pending_display_frame = None
-        self.pending_display_stats = {'total_objects': 0, 'class_counts': {}}
-        self.pending_frame_dirty = False
-        self.last_preview_capture_ts = 0.0
-        if hasattr(self.video_label, 'clear_frame'):
-            self.video_label.clear_frame()
         self.video_thread.start()
         self.render_timer.start()
         self._update_fps_summary(self.pending_display_stats)
@@ -3264,13 +3211,16 @@ class MainWindow(QMainWindow):
         self._update_vehicle_alert_ui(self.pending_display_stats)
         self._refresh_runtime_overview()
         
-    def stop_processing(self, preserve_pending=False):
+    def stop_processing(self, preserve_pending=False, clear_display=False):
         """Stop video processing"""
         if not preserve_pending:
             self.pending_restart = False
             self.pending_reload_models = False
             self.pending_start_after_model_load = False
             self.restart_timer.stop()
+        if clear_display:
+            self.render_timer.stop()
+            self._reset_runtime_frame_state(clear_widget=True, widget_message="Dang chuyen nguon...")
         if self.video_thread:
             self.video_thread.stop()
             if self.video_thread.isRunning():
@@ -3332,10 +3282,13 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def _setup_status_panel(self, parent_layout):
-        """Realtime Status Panel - 9 Column Layout: 1 FPS + 7 Object Classes + 1 Total"""
+        """Realtime status panel with a single-row 8-card layout."""
         panel = QFrame()
         self.status_panel = panel
         panel.setObjectName("statusPanel")
+        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        panel.setMinimumHeight(120)
+        panel.setMaximumHeight(210)
         panel.setStyleSheet(
             "QFrame#statusPanel {"
             "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f8fafc, stop:1 #f1f5f9);"
@@ -3345,13 +3298,11 @@ class MainWindow(QMainWindow):
         )
 
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(16, 14, 16, 14)
-        panel_layout.setSpacing(12)
+        panel_layout.setContentsMargins(12, 8, 12, 8)
+        panel_layout.setSpacing(8)
 
-        # ========== HEADER: Title + Status Badge ==========
         header_row = QHBoxLayout()
         header_row.setSpacing(10)
-        
         title = QLabel("📊 Realtime Status")
         title.setFont(QFont("Segoe UI", 14, QFont.Bold))
         title.setStyleSheet("color: #1e293b;")
@@ -3360,7 +3311,7 @@ class MainWindow(QMainWindow):
 
         self.status_level_badge = QLabel("AN TOAN")
         self.status_level_badge.setAlignment(Qt.AlignCenter)
-        self.status_level_badge.setMinimumWidth(200)
+        self.status_level_badge.setMinimumWidth(220)
         self.status_level_badge.setStyleSheet(
             "background: #22c55e;"
             "color: #ffffff;"
@@ -3373,200 +3324,71 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self.status_level_badge)
         panel_layout.addLayout(header_row)
 
-        # ========== MAIN METRICS - 8 Columns Grid ==========
         metrics_container = QFrame()
         metrics_container.setStyleSheet(
             "background: #ffffff;"
             "border: 1px solid #e2e8f0;"
             "border-radius: 10px;"
-            "padding: 10px;"
+            "padding: 6px;"
         )
         metrics_layout = QGridLayout(metrics_container)
-        metrics_layout.setContentsMargins(6, 8, 6, 8)
-        metrics_layout.setHorizontalSpacing(8)
+        metrics_layout.setContentsMargins(4, 4, 4, 4)
+        metrics_layout.setHorizontalSpacing(10)
         metrics_layout.setVerticalSpacing(6)
-        
-        # ========== Column 0: FPS ==========
-        fps_title = QLabel("⚡ FPS")
-        fps_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        fps_title.setStyleSheet("color: #64748b;")
-        fps_title.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(fps_title, 0, 0)
-        
-        self.status_main_fps = QLabel("0.0")
-        self.status_main_fps.setFont(QFont("Segoe UI", 20, QFont.Bold))
-        self.status_main_fps.setStyleSheet("color: #22c55e;")
-        self.status_main_fps.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_main_fps, 1, 0)
-        
-        fps_subtitle = QLabel("Display")
-        fps_subtitle.setFont(QFont("Segoe UI", 7, QFont.Normal))
-        fps_subtitle.setStyleSheet("color: #94a3b8;")
-        fps_subtitle.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(fps_subtitle, 2, 0)
-        
-        # ========== Column 1: Pedestrian 🚶 ==========
-        ped_title = QLabel("🚶 Ped")
-        ped_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        ped_title.setStyleSheet("color: #64748b;")
-        ped_title.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(ped_title, 0, 1)
-        
-        self.status_pedestrian_now = QLabel("0")
-        self.status_pedestrian_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        self.status_pedestrian_now.setStyleSheet("color: #0f172a;")
-        self.status_pedestrian_now.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_pedestrian_now, 1, 1)
-        
-        self.status_pedestrian_total = QLabel("Total: 0")
-        self.status_pedestrian_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
-        self.status_pedestrian_total.setStyleSheet("color: #64748b;")
-        self.status_pedestrian_total.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_pedestrian_total, 2, 1)
-        
-        # ========== Column 2: Bicycle 🚲 ==========
-        bike_title = QLabel("🚲 Bike")
-        bike_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        bike_title.setStyleSheet("color: #64748b;")
-        bike_title.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(bike_title, 0, 2)
-        
-        self.status_bicycle_now = QLabel("0")
-        self.status_bicycle_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        self.status_bicycle_now.setStyleSheet("color: #0f172a;")
-        self.status_bicycle_now.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_bicycle_now, 1, 2)
-        
-        self.status_bicycle_total = QLabel("Total: 0")
-        self.status_bicycle_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
-        self.status_bicycle_total.setStyleSheet("color: #64748b;")
-        self.status_bicycle_total.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_bicycle_total, 2, 2)
-        
-        # ========== Column 3: Motorbike 🏍️ ==========
-        moto_title = QLabel("🏍️ Moto")
-        moto_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        moto_title.setStyleSheet("color: #64748b;")
-        moto_title.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(moto_title, 0, 3)
-        
-        self.status_moto_now = QLabel("0")
-        self.status_moto_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        self.status_moto_now.setStyleSheet("color: #0f172a;")
-        self.status_moto_now.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_moto_now, 1, 3)
-        
-        self.status_moto_total = QLabel("Total: 0")
-        self.status_moto_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
-        self.status_moto_total.setStyleSheet("color: #64748b;")
-        self.status_moto_total.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_moto_total, 2, 3)
-        
-        # ========== Column 4: Car 🚗 ==========
-        car_title = QLabel("🚗 Car")
-        car_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        car_title.setStyleSheet("color: #64748b;")
-        car_title.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(car_title, 0, 4)
-        
-        self.status_car_now = QLabel("0")
-        self.status_car_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        self.status_car_now.setStyleSheet("color: #0f172a;")
-        self.status_car_now.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_car_now, 1, 4)
-        
-        self.status_car_total = QLabel("Total: 0")
-        self.status_car_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
-        self.status_car_total.setStyleSheet("color: #64748b;")
-        self.status_car_total.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_car_total, 2, 4)
-        
-        # ========== Column 5: Truck 🚚 ==========
-        truck_title = QLabel("🚚 Truck")
-        truck_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        truck_title.setStyleSheet("color: #64748b;")
-        truck_title.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(truck_title, 0, 5)
-        
-        self.status_truck_now = QLabel("0")
-        self.status_truck_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        self.status_truck_now.setStyleSheet("color: #0f172a;")
-        self.status_truck_now.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_truck_now, 1, 5)
-        
-        self.status_truck_total = QLabel("Total: 0")
-        self.status_truck_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
-        self.status_truck_total.setStyleSheet("color: #64748b;")
-        self.status_truck_total.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_truck_total, 2, 5)
-        
-        # ========== Column 6: Container Truck 📦 ==========
-        container_title = QLabel("📦 Cont")
-        container_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        container_title.setStyleSheet("color: #64748b;")
-        container_title.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(container_title, 0, 6)
-        
-        self.status_container_now = QLabel("0")
-        self.status_container_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        self.status_container_now.setStyleSheet("color: #0f172a;")
-        self.status_container_now.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_container_now, 1, 6)
-        
-        self.status_container_total = QLabel("Total: 0")
-        self.status_container_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
-        self.status_container_total.setStyleSheet("color: #64748b;")
-        self.status_container_total.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_container_total, 2, 6)
-        
-        # ========== Column 7: Bus 🚌 ==========
-        bus_title = QLabel("🚌 Bus")
-        bus_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        bus_title.setStyleSheet("color: #64748b;")
-        bus_title.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(bus_title, 0, 7)
-        
-        self.status_bus_now = QLabel("0")
-        self.status_bus_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        self.status_bus_now.setStyleSheet("color: #0f172a;")
-        self.status_bus_now.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_bus_now, 1, 7)
-        
-        self.status_bus_total = QLabel("Total: 0")
-        self.status_bus_total.setFont(QFont("Segoe UI", 8, QFont.Normal))
-        self.status_bus_total.setStyleSheet("color: #64748b;")
-        self.status_bus_total.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_bus_total, 2, 7)
-        
-        # ========== Column 8: TOTAL ALL 📊 ==========
-        total_title = QLabel("📊 Total")
-        total_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        total_title.setStyleSheet("color: #1e40af;")
-        total_title.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(total_title, 0, 8)
-        
-        self.status_total_now = QLabel("0")
-        self.status_total_now.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        self.status_total_now.setStyleSheet("color: #1e40af;")
-        self.status_total_now.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_total_now, 1, 8)
-        
-        self.status_total_session = QLabel("Session: 0")
-        self.status_total_session.setFont(QFont("Segoe UI", 8, QFont.Normal))
-        self.status_total_session.setStyleSheet("color: #64748b;")
-        self.status_total_session.setAlignment(Qt.AlignCenter)
-        metrics_layout.addWidget(self.status_total_session, 2, 8)
-        
-        # Set equal column stretch
-        for col in range(9):
+
+        def add_metric_card(title_text, value_attr, sub_attr, value_text, sub_text, row, col, value_color="#0f172a"):
+            card = QFrame()
+            card.setStyleSheet(
+                "background: #f8fafc;"
+                "border: 1px solid #d6deea;"
+                "border-radius: 10px;"
+            )
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(6, 4, 6, 4)
+            card_layout.setSpacing(2)
+
+            title_label = QLabel(title_text)
+            title_label.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            title_label.setStyleSheet("color: #64748b; border: none;")
+            title_label.setAlignment(Qt.AlignCenter)
+            card_layout.addWidget(title_label)
+
+            value_label = QLabel(value_text)
+            value_label.setFont(QFont("Segoe UI", 15, QFont.Bold))
+            value_label.setStyleSheet(f"color: {value_color}; border: none;")
+            value_label.setAlignment(Qt.AlignCenter)
+            card_layout.addWidget(value_label)
+
+            sub_label = QLabel(sub_text)
+            sub_label.setFont(QFont("Segoe UI", 8, QFont.Normal))
+            sub_label.setStyleSheet("color: #64748b; border: none;")
+            sub_label.setAlignment(Qt.AlignCenter)
+            card_layout.addWidget(sub_label)
+
+            setattr(self, value_attr, value_label)
+            setattr(self, sub_attr, sub_label)
+            metrics_layout.addWidget(card, row, col)
+
+        add_metric_card("⚡ FPS", "status_main_fps", "status_fps_subtitle", "0.0", "Display", 0, 0, "#22c55e")
+        add_metric_card("🚶 Ped", "status_pedestrian_now", "status_pedestrian_total", "0", "Total: 0", 0, 1)
+        add_metric_card("🚲 Bike", "status_bicycle_now", "status_bicycle_total", "0", "Total: 0", 0, 2)
+        add_metric_card("🏍️ Moto", "status_moto_now", "status_moto_total", "0", "Total: 0", 0, 3)
+        add_metric_card("🚗 Car", "status_car_now", "status_car_total", "0", "Total: 0", 0, 4)
+        add_metric_card("🚚 Truck", "status_truck_now", "status_truck_total", "0", "Total: 0", 0, 5)
+        add_metric_card("🚌 Bus", "status_bus_now", "status_bus_total", "0", "Total: 0", 0, 6)
+        add_metric_card("📦 Cont", "status_container_now", "status_container_total", "0", "Total: 0", 0, 7)
+        add_metric_card("🔴 Now", "status_total_current_now", "status_total_current_sub", "0", "All class", 0, 8, "#dc2626")
+        add_metric_card("📊 Total", "status_total_session_now", "status_total_session_sub", "0", "Session", 0, 9, "#1d4ed8")
+
+        for col in range(10):
             metrics_layout.setColumnStretch(col, 1)
-        
+        metrics_layout.setRowStretch(0, 1)
+
         panel_layout.addWidget(metrics_container)
-        
         parent_layout.addWidget(panel)
 
     def _normalize_vehicle_counts(self, counts):
-        """Normalize all 7 object classes"""
+        """Normalize all 7 object classes for legacy compact grid."""
         normalized = {
             "pedestrian": 0,
             "bicycle": 0,
@@ -3574,13 +3396,12 @@ class MainWindow(QMainWindow):
             "car": 0,
             "truck": 0,
             "container truck": 0,
-            "bus": 0
+            "bus": 0,
         }
         if not counts:
             return normalized
         for cls_name, count in counts.items():
             key = str(cls_name).strip().lower()
-            # Map variations to standard names
             if key in ["pedestrian", "person", "people"]:
                 normalized["pedestrian"] += int(count)
             elif key in ["bicycle", "bike", "cycle"]:
@@ -3607,22 +3428,37 @@ class MainWindow(QMainWindow):
         parts = [f"{label}: {counts.get(key, 0)}" for key, label in order]
         return " | ".join(parts)
 
+    def _set_fps_badge_color(self, fps_value):
+        """Legacy helper kept for compatibility."""
+        if fps_value >= 20:
+            color = '#22c55e'
+        elif fps_value >= 10:
+            color = '#f59e0b'
+        else:
+            color = '#ef4444'
+
+        if color == self.last_fps_color:
+            return
+
+        if hasattr(self, 'status_main_fps'):
+            self.status_main_fps.setStyleSheet(
+                "color: {color};"
+                "font-weight: 700;"
+                .format(color=color)
+            )
+        self.last_fps_color = color
+
     def _update_fps_summary(self, stats):
-        """Update FPS in single column (Display FPS only - most accurate)"""
-        # Use Display FPS as the main metric (what user actually sees)
+        """Update FPS in single compact column (Display FPS)."""
         main_fps = self.current_render_fps
-        
         if hasattr(self, 'status_main_fps'):
             self.status_main_fps.setText(f"{main_fps:.1f}")
-            
-            # Color coding based on FPS
             if main_fps >= 20:
-                color = '#22c55e'  # Green
+                color = '#22c55e'
             elif main_fps >= 10:
-                color = '#f59e0b'  # Yellow
+                color = '#f59e0b'
             else:
-                color = '#ef4444'  # Red
-            
+                color = '#ef4444'
             self.status_main_fps.setStyleSheet(f"color: {color}; font-weight: 700;")
 
     def _extract_vehicle_count(self, counts):
@@ -3631,7 +3467,7 @@ class MainWindow(QMainWindow):
         return sum(normalized.values())
 
     def _update_vehicle_alert_ui(self, stats):
-        """Update vehicle alert UI with 8-column layout (1 FPS + 7 object classes)"""
+        """Update compact legacy grid + alert badge + video border color."""
         active_counts = stats.get('active_class_counts', {}) if isinstance(stats, dict) else {}
         total_counts = stats.get('class_counts', {}) if isinstance(stats, dict) else {}
         active_all_counts = self._normalize_vehicle_counts(active_counts)
@@ -3645,33 +3481,24 @@ class MainWindow(QMainWindow):
 
         if roi_active:
             current_vehicles = sum(active_all_counts.values())
-            scope_text = "ROI"
         else:
             current_vehicles = sum(total_all_counts.values())
-            scope_text = "Full"
-        total_vehicles = sum(total_all_counts.values())
 
         limit = max(1, int(self.vehicle_alert_limit))
         ratio = current_vehicles / float(limit)
 
         if ratio > 1.0:
-            level = "ALERT"
             color = "#ef4444"
             message = "VUOT NGUONG"
         elif ratio >= self.alert_yellow_ratio:
-            level = "WARN"
             color = "#f59e0b"
             message = "GAN NGUONG"
         else:
-            level = "NORMAL"
             color = "#22c55e"
             message = "AN TOAN"
 
         ratio_percent = min(999, int(ratio * 100))
-        
-        # Update status badge with detailed traffic info
         if hasattr(self, 'status_level_badge'):
-            # Format: "AN TOAN | 6/20 (30%)"
             badge_text = f"{message} | {current_vehicles}/{limit} ({ratio_percent}%)"
             self.status_level_badge.setText(badge_text)
             self.status_level_badge.setStyleSheet(
@@ -3684,52 +3511,48 @@ class MainWindow(QMainWindow):
                 "letter-spacing: 0.5px;"
             )
 
-        # Update individual object columns (Now + Total)
         if hasattr(self, 'status_pedestrian_now'):
             self.status_pedestrian_now.setText(str(active_all_counts.get('pedestrian', 0)))
         if hasattr(self, 'status_pedestrian_total'):
             self.status_pedestrian_total.setText(f"Total: {total_all_counts.get('pedestrian', 0)}")
-            
+
         if hasattr(self, 'status_bicycle_now'):
             self.status_bicycle_now.setText(str(active_all_counts.get('bicycle', 0)))
         if hasattr(self, 'status_bicycle_total'):
             self.status_bicycle_total.setText(f"Total: {total_all_counts.get('bicycle', 0)}")
-            
+
         if hasattr(self, 'status_moto_now'):
             self.status_moto_now.setText(str(active_all_counts.get('motorbike', 0)))
         if hasattr(self, 'status_moto_total'):
             self.status_moto_total.setText(f"Total: {total_all_counts.get('motorbike', 0)}")
-            
+
         if hasattr(self, 'status_car_now'):
             self.status_car_now.setText(str(active_all_counts.get('car', 0)))
         if hasattr(self, 'status_car_total'):
             self.status_car_total.setText(f"Total: {total_all_counts.get('car', 0)}")
-            
+
         if hasattr(self, 'status_truck_now'):
             self.status_truck_now.setText(str(active_all_counts.get('truck', 0)))
         if hasattr(self, 'status_truck_total'):
             self.status_truck_total.setText(f"Total: {total_all_counts.get('truck', 0)}")
-            
+
         if hasattr(self, 'status_container_now'):
             self.status_container_now.setText(str(active_all_counts.get('container truck', 0)))
         if hasattr(self, 'status_container_total'):
             self.status_container_total.setText(f"Total: {total_all_counts.get('container truck', 0)}")
-            
+
         if hasattr(self, 'status_bus_now'):
             self.status_bus_now.setText(str(active_all_counts.get('bus', 0)))
         if hasattr(self, 'status_bus_total'):
             self.status_bus_total.setText(f"Total: {total_all_counts.get('bus', 0)}")
-        
-        # Update TOTAL column (sum of all classes)
+
         total_now = sum(active_all_counts.values())
         total_session = sum(total_all_counts.values())
-        
-        if hasattr(self, 'status_total_now'):
-            self.status_total_now.setText(str(total_now))
-        if hasattr(self, 'status_total_session'):
-            self.status_total_session.setText(f"Session: {total_session}")
+        if hasattr(self, 'status_total_current_now'):
+            self.status_total_current_now.setText(str(total_now))
+        if hasattr(self, 'status_total_session_now'):
+            self.status_total_session_now.setText(str(total_session))
 
-        # Update video border color
         if hasattr(self, 'video_label'):
             self.video_label.setStyleSheet(
                 f"border: 4px solid {color};"
@@ -3751,8 +3574,8 @@ class MainWindow(QMainWindow):
             "",
         ]
 
-        session_block = self._format_count_block("Session Counts", total_class_counts)
-        active_block = self._format_count_block("Active Frame", active_class_counts)
+        session_block = self._format_count_block("Session Total", total_class_counts)
+        active_block = self._format_count_block("Now", active_class_counts)
 
         if session_block:
             lines.append(session_block)
@@ -3797,25 +3620,11 @@ class MainWindow(QMainWindow):
         self.schedule_settings_save()
 
     def _apply_admin_source_grid_columns(self, refresh_cards=False):
-        """Apply grid column layout with proper viewport width detection"""
         if not hasattr(self, 'admin_source_list'):
             return
 
         columns = max(2, min(7, int(getattr(self, 'source_grid_columns', 5))))
-        
-        # Get actual viewport width (wait for widget to be visible)
-        viewport = self.admin_source_list.viewport()
-        if not viewport or not viewport.isVisible():
-            # Widget not ready yet, schedule retry
-            QTimer.singleShot(100, lambda: self._apply_admin_source_grid_columns(refresh_cards=refresh_cards))
-            return
-        
-        list_width = max(320, viewport.width())
-        
-        # Ensure minimum width for proper calculation
-        if list_width < 400:
-            list_width = max(800, self.admin_source_list.width() - 20)
-        
+        list_width = max(320, self.admin_source_list.viewport().width())
         usable_width = max(280, list_width - 8)
 
         min_spacing = 6
@@ -3877,14 +3686,13 @@ class MainWindow(QMainWindow):
 
     def _render_latest_frame(self):
         """Render the newest frame at a stable UI cadence."""
+        self.render_fps_counter += 1
         version, latest_frame, latest_stats = self.shared_frame_store.read()
         if version > self.pending_frame_version and latest_frame is not None:
             self.pending_frame_version = version
             self.pending_display_frame = latest_frame
             self.pending_display_stats = latest_stats
             self.pending_frame_dirty = True
-            # Only count frames that are actually new
-            self.render_fps_counter += 1
 
         if version > self.metrics_last_version:
             self.fps_counter += (version - self.metrics_last_version)
@@ -3903,8 +3711,9 @@ class MainWindow(QMainWindow):
 
             if self.adaptive_fps:
                 self._maybe_adaptive_tune()
-            # Don't update FPS UI here - will be updated with render FPS below
+            self._update_fps_summary(self.pending_display_stats)
             self._update_stats_panel(self.pending_display_stats)
+            self._update_vehicle_alert_ui(self.pending_display_stats)
 
             self.fps_counter = 0
             self.fps_start_time = time.perf_counter()
@@ -4211,29 +4020,86 @@ class MainWindow(QMainWindow):
                 self.video_source = last_video_file_path
                 self.btn_start.setEnabled(True)
 
+            id_alias = {}
             loaded_profiles = settings.get('source_profiles', [])
             if isinstance(loaded_profiles, list):
                 self.source_profiles = []
-                for profile in loaded_profiles:
-                    if not isinstance(profile, dict):
+                seen_keys = {}
+                used_ids = set()
+                fallback_id = 1
+
+                for raw_profile in loaded_profiles:
+                    if not isinstance(raw_profile, dict):
                         continue
-                    source = profile.get('source')
+                    source = raw_profile.get('source')
                     if source is None:
                         continue
+
+                    source_key = self._source_to_key(source)
+                    source_type = raw_profile.get('source_type', 'source')
+                    name = raw_profile.get('name', self._display_name_for_source(source))
+                    profile_settings = raw_profile.get('settings', {})
+                    if not isinstance(profile_settings, dict):
+                        profile_settings = {}
+
+                    raw_id = raw_profile.get('id', 0)
+                    try:
+                        profile_id = int(raw_id)
+                    except Exception:
+                        profile_id = 0
+                    if profile_id <= 0 or profile_id in used_ids:
+                        while fallback_id in used_ids:
+                            fallback_id += 1
+                        if profile_id > 0:
+                            id_alias[profile_id] = fallback_id
+                        profile_id = fallback_id
+                        fallback_id += 1
+
                     normalized = {
-                        'id': profile.get('id', self.source_profile_counter),
+                        'id': profile_id,
                         'source': source,
-                        'source_key': profile.get('source_key', self._source_to_key(source)),
-                        'source_type': profile.get('source_type', 'source'),
-                        'name': profile.get('name', self._display_name_for_source(source)),
-                        'settings': profile.get('settings', {}),
+                        'source_key': source_key,
+                        'source_type': source_type,
+                        'name': name,
+                        'settings': profile_settings,
                     }
+
+                    existing_idx = seen_keys.get(source_key)
+                    if existing_idx is not None:
+                        existing = self.source_profiles[existing_idx]
+                        id_alias[profile_id] = existing.get('id')
+
+                        existing_name = str(existing.get('name') or "").strip()
+                        incoming_name = str(name or "").strip()
+                        default_existing_name = self._display_name_for_source(existing.get('source'))
+                        if incoming_name and (not existing_name or existing_name == default_existing_name):
+                            existing['name'] = incoming_name
+
+                        if existing.get('source_type', 'source') in ("", "source", None) and source_type not in ("", "source", None):
+                            existing['source_type'] = source_type
+                        if profile_settings:
+                            existing['settings'] = profile_settings
+                        continue
+
                     self.source_profiles.append(normalized)
+                    seen_keys[source_key] = len(self.source_profiles) - 1
+                    used_ids.add(profile_id)
+
             self.source_profile_counter = int(settings.get('source_profile_counter', max(1, len(self.source_profiles) + 1)))
             if self.source_profiles:
                 max_id = max(int(p.get('id', 0)) for p in self.source_profiles)
                 self.source_profile_counter = max(self.source_profile_counter, max_id + 1)
-            self.active_source_profile_id = settings.get('active_source_profile_id')
+            raw_active_id = settings.get('active_source_profile_id')
+            try:
+                active_id = int(raw_active_id) if raw_active_id is not None else None
+            except Exception:
+                active_id = None
+            if active_id in id_alias:
+                active_id = id_alias[active_id]
+            valid_ids = {int(p.get('id', 0)) for p in self.source_profiles}
+            if active_id not in valid_ids:
+                active_id = self.source_profiles[0].get('id') if self.source_profiles else None
+            self.active_source_profile_id = active_id
             loaded_columns = int(settings.get('source_grid_columns', self.source_grid_columns))
             self.source_grid_columns = max(2, min(7, loaded_columns))
             loaded_text_size = str(settings.get('source_tile_text_size', self.source_tile_text_size))
@@ -4431,14 +4297,18 @@ class MainWindow(QMainWindow):
             return -1
         key = self._source_to_key(source)
         for i, profile in enumerate(self.source_profiles):
-            profile_key = profile.get('source_key')
-            # Fallback: compute key if missing or empty
-            if not profile_key:
-                profile_source = profile.get('source')
-                if profile_source is not None:
+            profile_source = profile.get('source')
+            profile_key = None
+            if profile_source is not None:
+                try:
                     profile_key = self._source_to_key(profile_source)
-                    # Cache it for future lookups
-                    profile['source_key'] = profile_key
+                except Exception:
+                    profile_key = None
+            if not profile_key:
+                profile_key = profile.get('source_key')
+            if profile_key and profile.get('source_key') != profile_key:
+                # Normalize stale keys from old settings format.
+                profile['source_key'] = profile_key
             if profile_key and profile_key == key:
                 return i
         return -1
@@ -4626,11 +4496,21 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'admin_source_list'):
             return
 
-        row = -1
-        for idx, profile in enumerate(self.source_profiles):
+        profile_id = None
+        for profile in self.source_profiles:
             if self._source_to_key(profile.get('source')) == source_key:
-                row = idx
+                profile_id = profile.get('id')
                 break
+        if profile_id is None:
+            return
+
+        row_map = getattr(self, 'admin_row_profile_ids', [])
+        if not isinstance(row_map, list):
+            return
+        try:
+            row = row_map.index(profile_id)
+        except ValueError:
+            return
         if row < 0 or row >= self.admin_source_list.count():
             return
 
@@ -4847,10 +4727,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'main_view_stack'):
             self.main_view_stack.setCurrentIndex(0)
         self.video_title_label.setText("Camera Admin Dashboard")
-        
-        # Fix: Apply grid layout AFTER widget is visible and rendered
-        QTimer.singleShot(50, lambda: self._apply_admin_source_grid_columns(refresh_cards=True))
-        
+        self.refresh_admin_source_cards()
         if hasattr(self, 'stream_group'):
             self.stream_group.setVisible(True)
         if hasattr(self, 'source_hub_group'):
@@ -4952,8 +4829,6 @@ class MainWindow(QMainWindow):
         self.btn_admin_open_source.setEnabled(has_valid_selection)
         if hasattr(self, 'btn_admin_rename_source'):
             self.btn_admin_rename_source.setEnabled(has_valid_selection)
-        if hasattr(self, 'btn_admin_delete_source'):
-            self.btn_admin_delete_source.setEnabled(has_valid_selection)
 
     def on_admin_source_selected(self, row):
         if row < 0 or row >= len(getattr(self, 'admin_row_profile_ids', [])):
@@ -5006,7 +4881,7 @@ class MainWindow(QMainWindow):
             return
 
         row = self.admin_source_list.row(item)
-        if row < 0 or row >= len(self.source_profiles):
+        if row < 0 or row >= len(getattr(self, 'admin_row_profile_ids', [])):
             return
 
         self.admin_source_list.setCurrentRow(row)
@@ -5143,37 +5018,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'source_profile_status'):
             self.source_profile_status.setText("Da xoa nguon")
 
-    def delete_selected_admin_source(self):
-        """Xoa nguon duoc chon tu nut Xoa Nguon"""
-        if not hasattr(self, 'admin_source_list'):
-            return
-        
-        row = self.admin_source_list.currentRow()
-        if row < 0 or row >= len(getattr(self, 'admin_row_profile_ids', [])):
-            if hasattr(self, 'source_profile_status'):
-                self.source_profile_status.setText("Chon nguon de xoa")
-            return
-        
-        # Xac nhan truoc khi xoa
-        profile_id = self.admin_row_profile_ids[row]
-        profile = next((p for p in self.source_profiles if p.get('id') == profile_id), None)
-        if profile is None:
-            return
-        
-        source_name = profile.get('name') or self._display_name_for_source(profile.get('source'))
-        
-        from PyQt5.QtWidgets import QMessageBox
-        reply = QMessageBox.question(
-            self, 
-            'Xac nhan xoa', 
-            f'Ban co chac chan muon xoa nguon "{source_name}"?',
-            QMessageBox.Yes | QMessageBox.No, 
-            QMessageBox.No
-        )
-        
-        if reply == QMessageBox.Yes:
-            self.remove_admin_source_from_menu(row)
-
     def open_selected_admin_source(self):
         if not hasattr(self, 'admin_source_list'):
             return
@@ -5227,12 +5071,17 @@ class MainWindow(QMainWindow):
         # Find existing profile - use computed key for safety
         idx = -1
         for i, profile in enumerate(self.source_profiles):
-            profile_key = profile.get('source_key')
-            if not profile_key:
-                profile_source = profile.get('source')
-                if profile_source is not None:
+            profile_source = profile.get('source')
+            profile_key = None
+            if profile_source is not None:
+                try:
                     profile_key = self._source_to_key(profile_source)
-                    profile['source_key'] = profile_key
+                except Exception:
+                    profile_key = None
+            if not profile_key:
+                profile_key = profile.get('source_key')
+            if profile_key and profile.get('source_key') != profile_key:
+                profile['source_key'] = profile_key
             if profile_key and profile_key == source_key:
                 idx = i
                 break
@@ -5241,6 +5090,8 @@ class MainWindow(QMainWindow):
 
         if idx >= 0:
             # Update existing profile
+            self.source_profiles[idx]['source'] = source
+            self.source_profiles[idx]['source_key'] = source_key
             self.source_profiles[idx]['settings'] = payload
             self.source_profiles[idx]['source_type'] = source_type
             if display_name is not None:
@@ -5267,9 +5118,16 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'admin_source_list') or not hasattr(self, 'admin_name_input'):
             return
         row = self.admin_source_list.currentRow()
-        if row < 0 or row >= len(self.source_profiles):
+        if row < 0 or row >= len(getattr(self, 'admin_row_profile_ids', [])):
             if hasattr(self, 'source_profile_status'):
                 self.source_profile_status.setText("Chon nguon truoc khi doi ten")
+            return
+
+        profile_id = self.admin_row_profile_ids[row]
+        source_row = next((idx for idx, p in enumerate(self.source_profiles) if p.get('id') == profile_id), -1)
+        if source_row < 0:
+            if hasattr(self, 'source_profile_status'):
+                self.source_profile_status.setText("Khong tim thay profile nguon")
             return
 
         new_name = self.admin_name_input.text().strip()
@@ -5278,7 +5136,7 @@ class MainWindow(QMainWindow):
                 self.source_profile_status.setText("Nhap ten moi")
             return
 
-        self.source_profiles[row]['name'] = new_name
+        self.source_profiles[source_row]['name'] = new_name
         self._refresh_source_profiles_ui()
         self.schedule_settings_save()
         if hasattr(self, 'source_profile_status'):
@@ -5316,6 +5174,7 @@ class MainWindow(QMainWindow):
             self.source_profile_status.setText("Select a source profile first")
             return
 
+        self._cancel_pending_stream_resolve()
         profile = self.source_profiles[row]
         self.active_source_profile_id = profile.get('id')
         self.video_source = profile.get('source')
@@ -5423,7 +5282,7 @@ def _ensure_python310_runtime() -> bool:
 
 
 def main():
-    """Main entry point with splash screen"""
+    """Main entry point"""
     if not _ensure_python310_runtime():
         return
 
@@ -5432,29 +5291,8 @@ def main():
     # Set dark theme
     app.setStyle('Fusion')
     
-    # Show splash screen
-    splash = ModernSplashScreen()
-    splash.show()
-    splash.set_progress(10, "Loading application...")
-    QApplication.processEvents()
-    
-    # Simulate loading steps with progress
-    splash.set_progress(30, "Initializing UI components...")
-    QApplication.processEvents()
-    
-    # Create main window
-    splash.set_progress(50, "Loading detection models...")
     window = MainWindow()
-    
-    splash.set_progress(80, "Preparing interface...")
-    QApplication.processEvents()
-    
-    # Show main window
-    splash.set_progress(100, "Ready!")
     window.show()
-    
-    # Close splash after a short delay
-    QTimer.singleShot(500, splash.close)
     
     sys.exit(app.exec_())
 
