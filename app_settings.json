@@ -1,19 +1,19 @@
 {
   "model_choice": "Custom model...",
-  "custom_model_path": "D:/BaiTapSinhVien/DoAnKySu/UI/trainv4/yolo3v4.onnx",
+  "custom_model_path": "D:/BaiTapSinhVien/DoAnKySu/KetHopPaper/V1 Claude/best.pt",
   "tracker_choice": "SORT (Fast)",
   "confidence": 25,
   "duplicate_iou_threshold": 55,
-  "box_thickness": 3,
-  "font_size": 36,
-  "font_thickness": 3,
+  "box_thickness": 4,
+  "font_size": 57,
+  "font_thickness": 4,
   "display_point_mode": false,
   "trail_enabled": true,
   "max_det": 12,
   "tracker_age": 1,
   "frame_skip": 0,
   "resize_scale": "100% (Full Quality)",
-  "smooth_mode": false,
+  "smooth_mode": true,
   "processing_mode": "standard",
   "adaptive_fps": false,
   "stream_input": "rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/2701",
@@ -137,7 +137,28 @@
   "pin_active_source_first": true,
   "roi_threshold": 50,
   "roi_visible": true,
-  "roi_config": null,
+  "roi_config": {
+    "points": [
+      [
+        1580,
+        677
+      ],
+      [
+        1562,
+        1158
+      ],
+      [
+        2407,
+        1172
+      ],
+      [
+        1887,
+        677
+      ]
+    ],
+    "threshold": 0.5,
+    "active": true
+  },
   "vehicle_alert_limit": 87,
   "vehicle_alert_scope": "AUTO",
   "sidebar_visible": false,

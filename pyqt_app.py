@@ -838,14 +838,28 @@ class MainWindow(QMainWindow):
 
         admin_page = QWidget()
         admin_layout = QVBoxLayout(admin_page)
-        admin_layout.setContentsMargins(10, 10, 10, 10)
-        admin_layout.setSpacing(10)
+        admin_layout.setContentsMargins(8, 8, 8, 8)
+        admin_layout.setSpacing(8)
 
+        admin_header_row = QHBoxLayout()
         self.admin_heading_label = QLabel("Quan Ly Nguon Camera")
         self.admin_heading_label.setObjectName("videoTitle")
-        admin_layout.addWidget(self.admin_heading_label)
+        admin_header_row.addWidget(self.admin_heading_label)
+        admin_header_row.addStretch()
 
-        self.admin_subtitle_label = QLabel("Dat ten de phan loai nguon nhanh hon. Chon tile de mo player lon.")
+        self.btn_admin_add_source_menu = QToolButton()
+        self.btn_admin_add_source_menu.setText("+ Them nguon")
+        self.btn_admin_add_source_menu.setObjectName("adminAddSourceButton")
+        self.btn_admin_add_source_menu.setPopupMode(QToolButton.InstantPopup)
+        admin_add_menu = QMenu(self.btn_admin_add_source_menu)
+        admin_add_menu.addAction("Them URL/Cam", self.prompt_add_admin_source)
+        admin_add_menu.addAction("Them File", self.add_admin_source_from_file)
+        admin_add_menu.addAction("Quan ly day du", self.open_source_manager_dialog)
+        self.btn_admin_add_source_menu.setMenu(admin_add_menu)
+        admin_header_row.addWidget(self.btn_admin_add_source_menu)
+        admin_layout.addLayout(admin_header_row)
+
+        self.admin_subtitle_label = QLabel("Chon tile de mo player. Click chuot phai de xem menu.")
         self.admin_subtitle_label.setObjectName("subtleInfo")
         self.admin_subtitle_label.setWordWrap(True)
         admin_layout.addWidget(self.admin_subtitle_label)
@@ -861,6 +875,8 @@ class MainWindow(QMainWindow):
         self.btn_admin_rename_source.setEnabled(False)
         admin_name_row.addWidget(self.btn_admin_rename_source)
         admin_layout.addLayout(admin_name_row)
+        self.admin_name_input.setVisible(False)
+        self.btn_admin_rename_source.setVisible(False)
 
         admin_input_row = QHBoxLayout()
         self.admin_source_input = QLineEdit()
@@ -876,6 +892,9 @@ class MainWindow(QMainWindow):
         self.btn_admin_add_file.clicked.connect(self.add_admin_source_from_file)
         admin_input_row.addWidget(self.btn_admin_add_file)
         admin_layout.addLayout(admin_input_row)
+        self.admin_source_input.setVisible(False)
+        self.btn_admin_add_url.setVisible(False)
+        self.btn_admin_add_file.setVisible(False)
 
         admin_grid_row = QHBoxLayout()
         admin_grid_row.addWidget(QLabel("Nguon / hang:"))
@@ -901,7 +920,7 @@ class MainWindow(QMainWindow):
 
         self.admin_source_list = QListWidget()
         self.admin_source_list.setObjectName("adminSourceList")
-        self.admin_source_list.setMinimumHeight(320)
+        self.admin_source_list.setMinimumHeight(300)
         self.admin_source_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.admin_source_list.setViewMode(QListWidget.IconMode)
         self.admin_source_list.setIconSize(QSize(self.preview_width, self.preview_height))
@@ -936,9 +955,9 @@ class MainWindow(QMainWindow):
         self._apply_admin_source_grid_columns(refresh_cards=False)
 
         player_page = QWidget()
-        player_layout = QVBoxLayout(player_page)
+        player_layout = QHBoxLayout(player_page)
         player_layout.setContentsMargins(0, 0, 0, 0)
-        player_layout.setSpacing(0)
+        player_layout.setSpacing(8)
 
         # Video display label
         self.video_label = VideoOpenGLWidget()
@@ -951,14 +970,18 @@ class MainWindow(QMainWindow):
         self.video_label.setText("Load video or livestream to begin")
         self.video_label.setMouseTracking(True)
         self.video_label.mousePressEvent = self.on_video_label_click
-        player_layout.addWidget(self.video_label)
+
+        # Vertical status column on the left to preserve video height.
+        status_column = QVBoxLayout()
+        status_column.setContentsMargins(0, 0, 0, 0)
+        status_column.setSpacing(0)
+        self._setup_status_panel(status_column)
+        player_layout.addLayout(status_column, 0)
+        player_layout.addWidget(self.video_label, 1)
 
         self.main_view_stack.addWidget(admin_page)
         self.main_view_stack.addWidget(player_page)
         left_panel.addWidget(self.main_view_stack, 1)
-        
-        # New Consolidated Status Dashboard
-        self._setup_status_panel(left_panel)
         
         # Control buttons
         button_layout = QHBoxLayout()
@@ -981,9 +1004,9 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.btn_stop)
         
         left_panel.addLayout(button_layout)
-        # Keep live video area dominant; status row remains compact.
-        left_panel.setStretch(0, 12)
-        left_panel.setStretch(1, 0)
+        # Keep live video area dominant.
+        left_panel.setStretch(0, 0)
+        left_panel.setStretch(1, 1)
         left_panel.setStretch(2, 0)
         
         # Right panel - Controls and stats
@@ -1766,6 +1789,18 @@ class MainWindow(QMainWindow):
             QToolButton:hover {
                 background: #ffedd5;
             }
+            QToolButton#adminAddSourceButton {
+                background: #0f766e;
+                color: #ffffff;
+                border: 1px solid #0f766e;
+                border-radius: 12px;
+                padding: 7px 12px;
+                font-size: 11px;
+                font-weight: 800;
+            }
+            QToolButton#adminAddSourceButton:hover {
+                background: #0d9488;
+            }
             QLabel#modelChip {
                 background: #1b2733;
                 color: #f8d4a4;
@@ -1856,21 +1891,25 @@ class MainWindow(QMainWindow):
                 selection-color: white;
             }
             QListWidget#adminSourceList {
-                background: #f7f1e7;
-                border: 1px solid #d7cab9;
-                border-radius: 14px;
-                padding: 8px;
+                background: #f8fafc;
+                border: 1px solid #dbe3ec;
+                border-radius: 18px;
+                padding: 10px;
                 outline: none;
             }
             QListWidget#adminSourceList::item {
-                background: #fffdf8;
-                border: 1px solid #d9ccb8;
-                border-radius: 12px;
-                padding: 6px;
-                margin: 4px;
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 16px;
+                padding: 8px;
+                margin: 5px;
+            }
+            QListWidget#adminSourceList::item:hover {
+                background: #f0f9ff;
+                border: 1px solid #7dd3fc;
             }
             QListWidget#adminSourceList::item:selected {
-                background: #e6f4ff;
+                background: #e0f2fe;
                 border: 2px solid #0284c7;
                 color: #0c4a6e;
             }
@@ -3282,13 +3321,13 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def _setup_status_panel(self, parent_layout):
-        """Realtime status panel with a single-row 8-card layout."""
+        """Realtime status panel as a vertical left sidebar."""
         panel = QFrame()
         self.status_panel = panel
         panel.setObjectName("statusPanel")
-        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        panel.setMinimumHeight(120)
-        panel.setMaximumHeight(210)
+        panel.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Expanding)
+        panel.setMinimumWidth(190)
+        panel.setMaximumWidth(240)
         panel.setStyleSheet(
             "QFrame#statusPanel {"
             "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f8fafc, stop:1 #f1f5f9);"
@@ -3298,69 +3337,65 @@ class MainWindow(QMainWindow):
         )
 
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(12, 8, 12, 8)
-        panel_layout.setSpacing(8)
+        panel_layout.setContentsMargins(10, 6, 10, 6)
+        panel_layout.setSpacing(4)
 
-        header_row = QHBoxLayout()
-        header_row.setSpacing(10)
         title = QLabel("📊 Realtime Status")
-        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        title.setFont(QFont("Segoe UI", 10, QFont.Bold))
         title.setStyleSheet("color: #1e293b;")
-        header_row.addWidget(title)
-        header_row.addStretch(1)
+        title.setAlignment(Qt.AlignCenter)
+        panel_layout.addWidget(title)
 
         self.status_level_badge = QLabel("AN TOAN")
         self.status_level_badge.setAlignment(Qt.AlignCenter)
-        self.status_level_badge.setMinimumWidth(220)
         self.status_level_badge.setStyleSheet(
             "background: #22c55e;"
             "color: #ffffff;"
             "border-radius: 12px;"
-            "padding: 8px 16px;"
+            "padding: 4px 10px;"
             "font-weight: 700;"
-            "font-size: 12px;"
+            "font-size: 11px;"
             "letter-spacing: 0.5px;"
         )
-        header_row.addWidget(self.status_level_badge)
-        panel_layout.addLayout(header_row)
+        panel_layout.addWidget(self.status_level_badge)
 
-        metrics_container = QFrame()
-        metrics_container.setStyleSheet(
+        metrics_host = QWidget()
+        metrics_host.setStyleSheet(
             "background: #ffffff;"
             "border: 1px solid #e2e8f0;"
             "border-radius: 10px;"
-            "padding: 6px;"
+            "padding: 4px;"
         )
-        metrics_layout = QGridLayout(metrics_container)
-        metrics_layout.setContentsMargins(4, 4, 4, 4)
-        metrics_layout.setHorizontalSpacing(10)
-        metrics_layout.setVerticalSpacing(6)
+        metrics_layout = QGridLayout(metrics_host)
+        metrics_layout.setContentsMargins(3, 3, 3, 3)
+        metrics_layout.setHorizontalSpacing(3)
+        metrics_layout.setVerticalSpacing(3)
 
         def add_metric_card(title_text, value_attr, sub_attr, value_text, sub_text, row, col, value_color="#0f172a"):
             card = QFrame()
             card.setStyleSheet(
                 "background: #f8fafc;"
                 "border: 1px solid #d6deea;"
-                "border-radius: 10px;"
+                "border-radius: 8px;"
             )
             card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(6, 4, 6, 4)
-            card_layout.setSpacing(2)
+            card_layout.setContentsMargins(6, 3, 6, 3)
+            card_layout.setSpacing(1)
 
             title_label = QLabel(title_text)
-            title_label.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            title_label.setFont(QFont("Segoe UI", 7, QFont.Bold))
             title_label.setStyleSheet("color: #64748b; border: none;")
             title_label.setAlignment(Qt.AlignCenter)
             card_layout.addWidget(title_label)
 
             value_label = QLabel(value_text)
-            value_label.setFont(QFont("Segoe UI", 15, QFont.Bold))
+            value_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
             value_label.setStyleSheet(f"color: {value_color}; border: none;")
             value_label.setAlignment(Qt.AlignCenter)
             card_layout.addWidget(value_label)
 
             sub_label = QLabel(sub_text)
-            sub_label.setFont(QFont("Segoe UI", 8, QFont.Normal))
+            sub_label.setFont(QFont("Segoe UI", 6, QFont.Normal))
             sub_label.setStyleSheet("color: #64748b; border: none;")
             sub_label.setAlignment(Qt.AlignCenter)
             card_layout.addWidget(sub_label)
@@ -3370,22 +3405,29 @@ class MainWindow(QMainWindow):
             metrics_layout.addWidget(card, row, col)
 
         add_metric_card("⚡ FPS", "status_main_fps", "status_fps_subtitle", "0.0", "Display", 0, 0, "#22c55e")
-        add_metric_card("🚶 Ped", "status_pedestrian_now", "status_pedestrian_total", "0", "Total: 0", 0, 1)
-        add_metric_card("🚲 Bike", "status_bicycle_now", "status_bicycle_total", "0", "Total: 0", 0, 2)
-        add_metric_card("🏍️ Moto", "status_moto_now", "status_moto_total", "0", "Total: 0", 0, 3)
-        add_metric_card("🚗 Car", "status_car_now", "status_car_total", "0", "Total: 0", 0, 4)
-        add_metric_card("🚚 Truck", "status_truck_now", "status_truck_total", "0", "Total: 0", 0, 5)
-        add_metric_card("🚌 Bus", "status_bus_now", "status_bus_total", "0", "Total: 0", 0, 6)
-        add_metric_card("📦 Cont", "status_container_now", "status_container_total", "0", "Total: 0", 0, 7)
-        add_metric_card("🔴 Now", "status_total_current_now", "status_total_current_sub", "0", "All class", 0, 8, "#dc2626")
-        add_metric_card("📊 Total", "status_total_session_now", "status_total_session_sub", "0", "Session", 0, 9, "#1d4ed8")
+        add_metric_card("🚶 Ped", "status_pedestrian_now", "status_pedestrian_total", "0", "Total: 0", 1, 0)
+        add_metric_card("🚲 Bike", "status_bicycle_now", "status_bicycle_total", "0", "Total: 0", 2, 0)
+        add_metric_card("🏍️ Moto", "status_moto_now", "status_moto_total", "0", "Total: 0", 3, 0)
+        add_metric_card("🚗 Car", "status_car_now", "status_car_total", "0", "Total: 0", 4, 0)
+        add_metric_card("🚚 Truck", "status_truck_now", "status_truck_total", "0", "Total: 0", 5, 0)
+        add_metric_card("🚌 Bus", "status_bus_now", "status_bus_total", "0", "Total: 0", 6, 0)
+        add_metric_card("📦 Cont", "status_container_now", "status_container_total", "0", "Total: 0", 7, 0)
+        add_metric_card("🔴 Now", "status_total_current_now", "status_total_current_sub", "0", "All class", 8, 0, "#dc2626")
+        add_metric_card("📊 Total", "status_total_session_now", "status_total_session_sub", "0", "Session", 9, 0, "#1d4ed8")
 
-        for col in range(10):
-            metrics_layout.setColumnStretch(col, 1)
-        metrics_layout.setRowStretch(0, 1)
+        metrics_layout.setColumnStretch(0, 1)
+        for row in range(10):
+            metrics_layout.setRowStretch(row, 0)
 
-        panel_layout.addWidget(metrics_container)
-        parent_layout.addWidget(panel)
+        metrics_scroll = QScrollArea()
+        metrics_scroll.setObjectName("statusMetricsScroll")
+        metrics_scroll.setWidgetResizable(True)
+        metrics_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        metrics_scroll.setFrameShape(QFrame.NoFrame)
+        metrics_scroll.setWidget(metrics_host)
+
+        panel_layout.addWidget(metrics_scroll, 1)
+        parent_layout.addWidget(panel, 1)
 
     def _normalize_vehicle_counts(self, counts):
         """Normalize all 7 object classes for legacy compact grid."""
@@ -3627,22 +3669,12 @@ class MainWindow(QMainWindow):
         list_width = max(320, self.admin_source_list.viewport().width())
         usable_width = max(280, list_width - 8)
 
-        min_spacing = 6
-        max_spacing = 20
         spacing = 10
-        card_w = max(170, (usable_width - spacing * (columns + 1)) // columns)
-
-        if card_w < 170:
-            spacing = min_spacing
-            card_w = max(160, (usable_width - spacing * (columns + 1)) // columns)
-
-        card_w = min(440, card_w)
-        distributed = usable_width - (card_w * columns)
-        spacing = max(min_spacing, min(max_spacing, distributed // (columns + 1)))
+        card_w = max(120, (usable_width - spacing * (columns - 1)) // columns)
         self.admin_source_list.setSpacing(spacing)
 
-        preview_w = max(156, card_w - 18)
-        preview_h = max(88, int(preview_w * 9 / 16))
+        preview_w = max(96, card_w - 18)
+        preview_h = max(54, int(preview_w * 9 / 16))
         text_size_map = {"Small": 9, "Medium": 10, "Large": 11}
         font_pt = text_size_map.get(self.source_tile_text_size, 10)
         list_font = self.admin_source_list.font()
@@ -3657,10 +3689,14 @@ class MainWindow(QMainWindow):
         self.preview_height = preview_h
         self.admin_source_list.setIconSize(QSize(preview_w, preview_h))
         self.admin_source_list.setGridSize(QSize(card_w, card_h))
+        for row in range(self.admin_source_list.count()):
+            self.admin_source_list.item(row).setSizeHint(QSize(card_w, card_h))
 
         if refresh_cards:
             if size_changed:
                 self.source_preview_cache.clear()
+                self.source_preview_meta.clear()
+                self.preview_load_pending.clear()
             self.refresh_admin_source_cards()
 
     def resizeEvent(self, event):
@@ -4100,6 +4136,11 @@ class MainWindow(QMainWindow):
             if active_id not in valid_ids:
                 active_id = self.source_profiles[0].get('id') if self.source_profiles else None
             self.active_source_profile_id = active_id
+            active_profile = next((p for p in self.source_profiles if p.get('id') == self.active_source_profile_id), None)
+            if active_profile is not None:
+                self.video_source = active_profile.get('source')
+                self._apply_source_profile_settings(active_profile.get('settings', {}))
+                self.btn_start.setEnabled(True)
             loaded_columns = int(settings.get('source_grid_columns', self.source_grid_columns))
             self.source_grid_columns = max(2, min(7, loaded_columns))
             loaded_text_size = str(settings.get('source_tile_text_size', self.source_tile_text_size))
@@ -4119,7 +4160,7 @@ class MainWindow(QMainWindow):
                 self.pin_active_checkbox.blockSignals(True)
                 self.pin_active_checkbox.setChecked(self.pin_active_source_first)
                 self.pin_active_checkbox.blockSignals(False)
-            self._apply_admin_source_grid_columns(refresh_cards=False)
+            self._apply_admin_source_grid_columns(refresh_cards=True)
             self._refresh_source_profiles_ui()
             
             # ROI settings
@@ -4324,6 +4365,13 @@ class MainWindow(QMainWindow):
         painter.end()
         return pixmap
 
+    def _fit_preview_pixmap(self, pixmap):
+        if pixmap is None or pixmap.isNull():
+            return self._create_placeholder_preview("NO SIGNAL")
+        if pixmap.width() == self.preview_width and pixmap.height() == self.preview_height:
+            return pixmap
+        return pixmap.scaled(self.preview_width, self.preview_height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
     def _preview_pixmap_from_bgr_frame(self, frame):
         if frame is None or frame.size == 0:
             return None
@@ -4516,7 +4564,22 @@ class MainWindow(QMainWindow):
 
         item = self.admin_source_list.item(row)
         if item is not None:
-            item.setIcon(QIcon(pixmap))
+            item.setIcon(QIcon(self._fit_preview_pixmap(pixmap)))
+
+    def prompt_add_admin_source(self):
+        raw, ok = QInputDialog.getText(self, "Them nguon", "URL / RTSP / YouTube / camera id:")
+        if not ok:
+            return
+        raw = (raw or "").strip()
+        if not raw:
+            if hasattr(self, 'source_profile_status'):
+                self.source_profile_status.setText("Nguon khong duoc de trong")
+            return
+        if hasattr(self, 'admin_source_input'):
+            self.admin_source_input.setText(raw)
+        if hasattr(self, 'admin_name_input'):
+            self.admin_name_input.setText("")
+        self.add_admin_source_from_input()
 
     def add_admin_source_from_input(self):
         raw = self.admin_source_input.text().strip() if hasattr(self, 'admin_source_input') else ""
@@ -4792,21 +4855,24 @@ class MainWindow(QMainWindow):
             max_chars = max(18, min(46, int(self.preview_width / size_factor)))
             if len(compact_title) > max_chars:
                 compact_title = compact_title[:max_chars - 3] + "..."
-            item_title = f"ACTIVE | {compact_title}" if is_active else compact_title
+            item_title = f"● ACTIVE  {compact_title}" if is_active else compact_title
             item = QListWidgetItem(f"{item_title}\n{source_type.upper()}")
             preview = self.source_preview_cache.get(source_key)
             if preview is None:
                 preview = self._create_placeholder_preview("LOADING")
                 self._enqueue_preview_load(source)
+            else:
+                preview = self._fit_preview_pixmap(preview)
             item.setIcon(QIcon(preview))
             item.setData(Qt.UserRole, profile.get('id'))
             item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            item.setSizeHint(self.admin_source_list.gridSize())
             item.setToolTip(f"{title}\nType: {source_type}\nSource: {source}")
             if is_active:
-                item.setBackground(QColor("#dcfce7"))
-                item.setForeground(QColor("#14532d"))
+                item.setBackground(QColor("#ecfdf5"))
+                item.setForeground(QColor("#065f46"))
             else:
-                item.setBackground(QColor("#fffdf8"))
+                item.setBackground(QColor("#ffffff"))
                 item.setForeground(QColor("#374151"))
             self.admin_source_list.addItem(item)
             self.admin_row_profile_ids.append(profile.get('id'))
@@ -4843,12 +4909,16 @@ class MainWindow(QMainWindow):
             self._update_admin_open_button_state()
             return
 
+        previous_active_id = self.active_source_profile_id
         self.active_source_profile_id = profile.get('id')
         if hasattr(self, 'admin_name_input'):
             self.admin_name_input.setText(profile.get('name') or "")
         if hasattr(self, 'source_profile_status'):
             self.source_profile_status.setText(f"Selected: {profile.get('name')}")
         self._update_admin_open_button_state()
+        if previous_active_id != self.active_source_profile_id:
+            self.schedule_settings_save()
+            self.refresh_admin_source_cards()
 
     def _capture_runtime_preview_for_active_source(self, frame):
         if frame is None or self.video_source is None:
@@ -5292,7 +5362,7 @@ def main():
     app.setStyle('Fusion')
     
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     
     sys.exit(app.exec_())
 
